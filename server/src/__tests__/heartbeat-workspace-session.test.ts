@@ -281,6 +281,41 @@ describe("assertGitSensitiveAdapterWorkspaceValid", () => {
     );
   });
 
+  it("allows a projectless read-only session workspace id without persisted execution workspace", async () => {
+    const agentId = "agent-1";
+    const fallbackCwd = resolveDefaultAgentWorkspaceDir(agentId);
+    const input = buildWorkspaceValidationInput();
+
+    await expect(
+      assertGitSensitiveAdapterWorkspaceValid(
+        buildWorkspaceValidationInput({
+          agentId,
+          issue: {
+            id: "issue-1",
+            identifier: "PAP-1",
+            projectId: null,
+            projectWorkspaceId: null,
+          },
+          resolvedWorkspace: buildResolvedWorkspace({
+            cwd: fallbackCwd,
+            source: "task_session",
+            projectId: null,
+            workspaceId: "read-only-workspace-ref",
+          }),
+          executionWorkspace: {
+            ...input.executionWorkspace,
+            baseCwd: fallbackCwd,
+            source: "task_session",
+            projectId: null,
+            workspaceId: "read-only-workspace-ref",
+            cwd: fallbackCwd,
+          },
+          persistedExecutionWorkspace: null,
+        }),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
   it("rejects a workspace-linked issue when no effective adapter cwd was resolved", async () => {
     const input = buildWorkspaceValidationInput();
 
