@@ -44,7 +44,7 @@ import {
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
-import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
+import { isOpenCodeTransientUpstreamError, isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -64,6 +64,33 @@ function firstNonEmptyLine(text: string): string {
       .map((line) => line.trim())
       .find(Boolean) ?? ""
   );
+}
+
+function boundedFailureReason(reason: unknown): string {
+  const text = reason instanceof Error ? reason.message : String(reason);
+  return text.replace(/\s+/g, " ").trim().slice(0, 500) || "unknown error";
+}
+
+export function createOpenCodeInstructionBundlePreflightFailure(input: {
+  instructionsFilePath: string;
+  reason: unknown;
+}): AdapterExecutionResult {
+  const reason = boundedFailureReason(input.reason);
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorMessage:
+      `OpenCode instruction-bundle preflight failed: could not read configured instructionsFilePath "${input.instructionsFilePath}": ${reason}`,
+    errorCode: "opencode_instruction_bundle_unreadable",
+    errorFamily: null,
+    resultJson: {
+      preflight: "instruction_bundle",
+      instructionsFilePath: input.instructionsFilePath,
+      reason,
+    },
+    clearSession: false,
+  };
 }
 
 function parseModelProvider(model: string | null): string | null {
@@ -313,6 +340,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
+    const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
+    const resolvedInstructionsFilePath = instructionsFilePath
+      ? path.resolve(cwd, instructionsFilePath)
+      : "";
+    const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
+    let instructionsPrefix = "";
+    let instructionsReadFailure: string | null = null;
+    if (resolvedInstructionsFilePath) {
+      try {
+        const instructionsContents = await fs.readFile(resolvedInstructionsFilePath, "utf8");
+        instructionsPrefix =
+          `${instructionsContents}\n\n` +
+          `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
+          `Resolve any relative file references from ${instructionsDir}.\n\n`;
+      } catch (err) {
+        instructionsReadFailure = boundedFailureReason(err);
+        await onLog(
+          "stdout",
+          `[paperclip] OpenCode instruction-bundle preflight failed for "${resolvedInstructionsFilePath}": ${instructionsReadFailure}\n`,
+        );
+        return createOpenCodeInstructionBundlePreflightFailure({
+          instructionsFilePath: resolvedInstructionsFilePath,
+          reason: instructionsReadFailure,
+        });
+      }
+    }
+
     const runtimeEnv = Object.fromEntries(
       Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
         (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -491,28 +545,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
     }
-    const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-    const resolvedInstructionsFilePath = instructionsFilePath
-      ? path.resolve(cwd, instructionsFilePath)
-      : "";
-    const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
-    let instructionsPrefix = "";
-    if (resolvedInstructionsFilePath) {
-      try {
-        const instructionsContents = await fs.readFile(resolvedInstructionsFilePath, "utf8");
-        instructionsPrefix =
-          `${instructionsContents}\n\n` +
-          `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
-          `Resolve any relative file references from ${instructionsDir}.\n\n`;
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        await onLog(
-          "stdout",
-          `[paperclip] Warning: could not read agent instructions file "${resolvedInstructionsFilePath}": ${reason}\n`,
-        );
-      }
-    }
-
     const commandNotes = (() => {
       const notes = [...preparedRuntimeConfig.notes];
       if (!resolvedInstructionsFilePath) return notes;
@@ -524,7 +556,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return notes;
       }
       notes.push(
-        `Configured instructionsFilePath ${resolvedInstructionsFilePath}, but file could not be read; continuing without injected instructions.`,
+        `Configured instructionsFilePath ${resolvedInstructionsFilePath}, but file could not be read: ${instructionsReadFailure ?? "unknown error"}.`,
       );
       return notes;
     })();
@@ -562,6 +594,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionHandoffChars: sessionHandoffNote.length,
       heartbeatPromptChars: renderedPrompt.length,
     };
+    if (prompt.trim().length === 0) {
+      await onLog(
+        "stdout",
+        "[paperclip] OpenCode preflight failed: rendered stdin prompt is empty; refusing to start provider command.\n",
+      );
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage:
+          "OpenCode preflight failed: rendered stdin prompt is empty. Check promptTemplate, wake context, and instruction-bundle configuration.",
+        errorCode: "opencode_missing_prompt_context",
+        errorFamily: null,
+        resultJson: {
+          preflight: "prompt_context",
+          promptMetrics,
+        },
+        clearSession: false,
+      };
+    }
 
     // Optional diagnostic: surface OpenCode's own logs on stderr (captured into the
     // run result) so failures that OpenCode otherwise wraps as an opaque
@@ -659,6 +711,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsedError ||
         stderrLine ||
         `OpenCode exited with code ${synthesizedExitCode ?? -1}`;
+      const transientUpstream =
+        (synthesizedExitCode ?? 0) !== 0 &&
+        isOpenCodeTransientUpstreamError({
+          stdout: attempt.proc.stdout,
+          stderr: attempt.proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
       const modelId = model || null;
 
       return {
@@ -666,6 +725,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         signal: attempt.proc.signal,
         timedOut: false,
         errorMessage: (synthesizedExitCode ?? 0) === 0 ? null : fallbackErrorMessage,
+        errorCode: transientUpstream ? "opencode_transient_upstream" : null,
+        errorFamily: transientUpstream ? "transient_upstream" : null,
+        retryNotBefore: null,
         usage: {
           inputTokens: attempt.parsed.usage.inputTokens,
           outputTokens: attempt.parsed.usage.outputTokens,
@@ -682,6 +744,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: {
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
+          ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),

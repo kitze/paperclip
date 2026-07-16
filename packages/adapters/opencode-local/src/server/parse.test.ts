@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+import { isOpenCodeTransientUpstreamError, parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
   it("parses assistant text, usage, cost, and errors", () => {
@@ -73,5 +73,42 @@ describe("parseOpenCodeJsonl", () => {
     expect(isOpenCodeUnknownSessionError("Session not found: s_123", "")).toBe(true);
     expect(isOpenCodeUnknownSessionError("", "unknown session id")).toBe(true);
     expect(isOpenCodeUnknownSessionError("all good", "")).toBe(false);
+  });
+
+  it("classifies OpenCode provider rate limits as transient upstream failures", () => {
+    expect(
+      isOpenCodeTransientUpstreamError({
+        stderr: "exceeded retry limit, last status: 429 Too Many Requests",
+      }),
+    ).toBe(true);
+    expect(
+      isOpenCodeTransientUpstreamError({
+        errorMessage: "Provider returned rate_limit_exceeded. Try again later.",
+      }),
+    ).toBe(true);
+    expect(
+      isOpenCodeTransientUpstreamError({
+        stdout: JSON.stringify({ type: "error", error: { message: "server overloaded" } }),
+      }),
+    ).toBe(true);
+  });
+
+  it("does not route rate limits through the stale-session retry path", () => {
+    const stderr = "exceeded retry limit, last status: 429 Too Many Requests";
+    expect(isOpenCodeTransientUpstreamError({ stderr })).toBe(true);
+    expect(isOpenCodeUnknownSessionError("", stderr)).toBe(false);
+  });
+
+  it("does not classify deterministic preflight or config failures as transient", () => {
+    expect(
+      isOpenCodeTransientUpstreamError({
+        errorMessage: "OpenCode instruction-bundle preflight failed: ENOENT: no such file or directory",
+      }),
+    ).toBe(false);
+    expect(
+      isOpenCodeTransientUpstreamError({
+        errorMessage: "OpenCode requires `adapterConfig.model` in provider/model format.",
+      }),
+    ).toBe(false);
   });
 });

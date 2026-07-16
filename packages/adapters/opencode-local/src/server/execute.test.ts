@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { ensureRemoteOpenCodeModelConfiguredAndAvailable } from "./execute.js";
+import {
+  createOpenCodeInstructionBundlePreflightFailure,
+  ensureRemoteOpenCodeModelConfiguredAndAvailable,
+} from "./execute.js";
 
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {
@@ -58,5 +61,37 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
         graceSec: 5,
       }),
     ).rejects.toThrow();
+  });
+});
+
+describe("createOpenCodeInstructionBundlePreflightFailure", () => {
+  it("returns a deterministic non-transient failure without requesting retry/session recovery", () => {
+    const result = createOpenCodeInstructionBundlePreflightFailure({
+      instructionsFilePath: "/workspace/.paperclip-runtime/AGENTS.md",
+      reason: new Error("ENOENT: no such file or directory, open '/workspace/.paperclip-runtime/AGENTS.md'"),
+    });
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "opencode_instruction_bundle_unreadable",
+      errorFamily: null,
+      clearSession: false,
+    });
+    expect(result.errorMessage).toContain("instruction-bundle preflight failed");
+    expect(result.resultJson).toMatchObject({
+      preflight: "instruction_bundle",
+      instructionsFilePath: "/workspace/.paperclip-runtime/AGENTS.md",
+    });
+  });
+
+  it("bounds noisy OS failure details before storing result metadata", () => {
+    const result = createOpenCodeInstructionBundlePreflightFailure({
+      instructionsFilePath: "/workspace/AGENTS.md",
+      reason: `bad ${"x".repeat(1000)}`,
+    });
+
+    expect(String(result.resultJson?.reason).length).toBeLessThanOrEqual(500);
   });
 });

@@ -1,5 +1,8 @@
 import { asNumber, asString, parseJson, parseObject } from "@paperclipai/adapter-utils/server-utils";
 
+const OPENCODE_TRANSIENT_UPSTREAM_RE =
+  /(?:rate[-\s]?limit(?:ed)?|rate_limit(?:ed|_error|_exceeded)?|too\s+many\s+requests|\b429\b|overloaded(?:_error)?|server\s+overloaded|service\s+unavailable|\b503\b|\b529\b|high\s+demand|try\s+again\s+later|temporarily\s+unavailable|throttl(?:ed|ing)|throttlingexception|servicequotaexceededexception|exceeded\s+retry\s+limit[\s\S]{0,120}429)/i;
+
 function errorText(value: unknown): string {
   if (typeof value === "string") return value;
   const rec = parseObject(value);
@@ -98,4 +101,29 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
   return /unknown\s+session|session\b.*\bnot\s+found|resource\s+not\s+found:.*[\\/]session[\\/].*\.json|notfounderror|no session/i.test(
     haystack,
   );
+}
+
+function buildOpenCodeErrorHaystack(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): string {
+  return [
+    input.errorMessage ?? "",
+    input.stdout ?? "",
+    input.stderr ?? "",
+  ]
+    .join("\n")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function isOpenCodeTransientUpstreamError(input: {
+  stdout?: string | null;
+  stderr?: string | null;
+  errorMessage?: string | null;
+}): boolean {
+  return OPENCODE_TRANSIENT_UPSTREAM_RE.test(buildOpenCodeErrorHaystack(input));
 }
