@@ -81,6 +81,31 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
   return inferOpenAiCompatibleBiller(env, null) ?? provider ?? "unknown";
 }
 
+function boundedFailureReason(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.length > 500 ? `${message.slice(0, 500)}...` : message;
+}
+
+export function createOpenCodeInstructionBundlePreflightFailure(input: {
+  instructionsFilePath: string;
+  reason: string;
+}): AdapterExecutionResult {
+  const reason = input.reason.trim() || "unknown error";
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorMessage:
+      `OpenCode instruction-bundle preflight failed: could not read configured instructionsFilePath "${input.instructionsFilePath}": ${reason}`,
+    errorCode: "opencode_instruction_bundle_unreadable",
+    resultJson: {
+      preflight: "instruction_bundle",
+      instructionsFilePath: input.instructionsFilePath,
+      reason,
+    },
+  };
+}
+
 const REMOTE_OPENCODE_MODELS_PROBE_DEFAULT_TIMEOUT_SEC = 20;
 const REMOTE_OPENCODE_MODELS_PROBE_SANDBOX_TIMEOUT_SEC = 120;
 
@@ -509,11 +534,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
           `Resolve any relative file references from ${instructionsDir}.\n\n`;
       } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
+        const reason = boundedFailureReason(err);
         await onLog(
           "stdout",
-          `[paperclip] Warning: could not read agent instructions file "${resolvedInstructionsFilePath}": ${reason}\n`,
+          `[paperclip] OpenCode instruction-bundle preflight failed for "${resolvedInstructionsFilePath}": ${reason}\n`,
         );
+        return createOpenCodeInstructionBundlePreflightFailure({
+          instructionsFilePath: resolvedInstructionsFilePath,
+          reason,
+        });
       }
     }
 
@@ -527,9 +556,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         return notes;
       }
-      notes.push(
-        `Configured instructionsFilePath ${resolvedInstructionsFilePath}, but file could not be read; continuing without injected instructions.`,
-      );
+      notes.push(`Configured instructionsFilePath ${resolvedInstructionsFilePath}.`);
       return notes;
     })();
 

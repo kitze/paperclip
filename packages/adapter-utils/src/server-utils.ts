@@ -2974,10 +2974,23 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          let stdinClosed = false;
+          stdin.on("error", (err: NodeJS.ErrnoException) => {
+            if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") {
+              stdinClosed = true;
+              return;
+            }
+            reject(err);
+          });
           void spawnPersistPromise.finally(() => {
-            if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
+            if (child.killed || stdin.destroyed || stdinClosed) return;
+            stdin.write(opts.stdin as string, (err?: Error | null) => {
+              if (err && (err as NodeJS.ErrnoException).code !== "EPIPE") {
+                reject(err);
+                return;
+              }
+              if (!stdin.destroyed) stdin.end();
+            });
           });
         }
 
