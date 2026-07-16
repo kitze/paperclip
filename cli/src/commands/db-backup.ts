@@ -77,6 +77,11 @@ export async function dbBackupCommand(opts: DbBackupOptions): Promise<void> {
       filenamePrefix,
     });
     spinner.stop(`Backup saved: ${formatDatabaseBackupResult(result)}`);
+    p.log.message(pc.dim(`Retention source: config.database.backup.retentionDays/--retention-days`));
+    p.log.message(pc.dim(`Retained backups: ${result.observability.totals.retainedCount} (${result.observability.totals.retainedBytes} bytes)`));
+    p.log.message(pc.dim(`Pruned backups: ${result.prunedCount}; post-prune candidates: ${result.observability.totals.pruneCandidateCount}`));
+    p.log.message(pc.dim(`7-day projection: ${result.observability.projection.projectedRetainedBytes ?? "insufficient history"} bytes retained`));
+    p.log.message(pc.dim(`Backup filesystem: ${result.observability.filesystem.status}`));
 
     if (opts.json) {
       console.log(
@@ -87,7 +92,9 @@ export async function dbBackupCommand(opts: DbBackupOptions): Promise<void> {
             prunedCount: result.prunedCount,
             backupDir,
             retentionDays,
+            retentionSource: "config.database.backup.retentionDays/--retention-days",
             connectionSource: connection.source,
+            observability: result.observability,
           },
           null,
           2,

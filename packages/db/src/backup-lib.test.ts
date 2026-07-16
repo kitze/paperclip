@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import { analyzeBackupDirectory, createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -70,6 +70,65 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+describe("analyzeBackupDirectory", () => {
+  it("reports tiered retention, latest growth, projection, and filesystem pressure", () => {
+    const tempDir = createTempDir("paperclip-backup-observability-");
+    const writeBackup = (name: string, sizeBytes: number, mtime: string) => {
+      const filePath = path.join(tempDir, name);
+      fs.writeFileSync(filePath, "x".repeat(sizeBytes));
+      const date = new Date(mtime);
+      fs.utimesSync(filePath, date, date);
+    };
+
+    writeBackup("paperclip-20260716-120000.sql.gz", 140, "2026-07-16T12:00:00.000Z");
+    writeBackup("paperclip-20260716-110000.sql.gz", 100, "2026-07-16T11:00:00.000Z");
+    writeBackup("paperclip-20260710-120000.sql.gz", 50, "2026-07-10T12:00:00.000Z");
+    writeBackup("paperclip-20260709-120000.sql.gz", 40, "2026-07-09T12:00:00.000Z");
+    writeBackup("paperclip-20260610-120000.sql.gz", 30, "2026-06-10T12:00:00.000Z");
+    writeBackup("paperclip-20260605-120000.sql.gz", 20, "2026-06-05T12:00:00.000Z");
+    writeBackup("paperclip-20260201-120000.sql.gz", 10, "2026-02-01T12:00:00.000Z");
+    writeBackup("other-20260716-120000.sql.gz", 999, "2026-07-16T12:00:00.000Z");
+
+    const report = analyzeBackupDirectory(
+      tempDir,
+      { dailyDays: 2, weeklyWeeks: 2, monthlyMonths: 3 },
+      "paperclip",
+      new Date("2026-07-16T12:00:00.000Z"),
+    );
+
+    expect(report.retention).toEqual({ dailyDays: 2, weeklyWeeks: 2, monthlyMonths: 3 });
+    expect(report.totals).toEqual({
+      count: 7,
+      bytes: 390,
+      retainedCount: 4,
+      retainedBytes: 320,
+      pruneCandidateCount: 3,
+      pruneCandidateBytes: 70,
+    });
+    expect(report.tiers.daily).toEqual({ count: 2, bytes: 240 });
+    expect(report.tiers.weekly).toEqual({ count: 1, bytes: 50 });
+    expect(report.tiers.monthly).toEqual({ count: 1, bytes: 30 });
+    expect(report.tiers.expired).toEqual({ count: 3, bytes: 70 });
+    expect(report.latest).toMatchObject({
+      name: "paperclip-20260716-120000.sql.gz",
+      sizeBytes: 140,
+      tier: "daily",
+      growthFromPreviousBytes: 40,
+      growthFromPreviousPercent: 40,
+    });
+    expect(report.projection).toEqual({
+      windowDays: 7,
+      basis: "latest_growth_rate",
+      growthPerDayBytes: 960,
+      projectedAddedBytes: 6720,
+      projectedRetainedBytes: 7040,
+    });
+    expect(report.filesystem.path).toBe(tempDir);
+    expect(["ok", "warning", "critical", "unknown"]).toContain(report.filesystem.status);
+    expect(report.filesystem.thresholds.warningAvailableBytes).toBeGreaterThan(0);
   });
 });
 

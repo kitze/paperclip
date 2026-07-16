@@ -1,4 +1,4 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statfsSync, statSync, unlinkSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
@@ -11,6 +11,71 @@ export type BackupRetentionPolicy = {
   dailyDays: number;
   weeklyWeeks: number;
   monthlyMonths: number;
+};
+
+export type BackupRetentionTier = "daily" | "weekly" | "monthly" | "expired";
+
+export type BackupRetentionTierSummary = {
+  count: number;
+  bytes: number;
+};
+
+export type BackupArtifactSummary = {
+  name: string;
+  fullPath: string;
+  sizeBytes: number;
+  mtime: string;
+  tier: BackupRetentionTier;
+};
+
+export type BackupFilesystemPressure = {
+  path: string;
+  status: "ok" | "warning" | "critical" | "unknown";
+  totalBytes: number | null;
+  availableBytes: number | null;
+  availablePercent: number | null;
+  totalInodes: number | null;
+  availableInodes: number | null;
+  availableInodesPercent: number | null;
+  thresholds: {
+    warningAvailableBytes: number;
+    criticalAvailableBytes: number;
+    warningAvailablePercent: number;
+    criticalAvailablePercent: number;
+    warningAvailableInodesPercent: number;
+    criticalAvailableInodesPercent: number;
+  };
+  warnings: string[];
+};
+
+export type BackupGrowthProjection = {
+  windowDays: number;
+  basis: "latest_growth_rate" | "insufficient_history";
+  growthPerDayBytes: number | null;
+  projectedAddedBytes: number | null;
+  projectedRetainedBytes: number | null;
+};
+
+export type BackupObservabilityReport = {
+  generatedAt: string;
+  backupDir: string;
+  filenamePrefix: string;
+  retention: BackupRetentionPolicy;
+  totals: {
+    count: number;
+    bytes: number;
+    retainedCount: number;
+    retainedBytes: number;
+    pruneCandidateCount: number;
+    pruneCandidateBytes: number;
+  };
+  tiers: Record<BackupRetentionTier, BackupRetentionTierSummary>;
+  latest: (BackupArtifactSummary & {
+    growthFromPreviousBytes: number | null;
+    growthFromPreviousPercent: number | null;
+  }) | null;
+  projection: BackupGrowthProjection;
+  filesystem: BackupFilesystemPressure;
 };
 
 export type RunDatabaseBackupOptions = {
@@ -34,6 +99,7 @@ export type RunDatabaseBackupResult = {
   backupFile: string;
   sizeBytes: number;
   prunedCount: number;
+  observability: BackupObservabilityReport;
 };
 
 export type RunDatabaseRestoreOptions = {
@@ -70,6 +136,12 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+const BACKUP_DISK_WARNING_BYTES = 10 * 1024 * 1024 * 1024;
+const BACKUP_DISK_CRITICAL_BYTES = 2 * 1024 * 1024 * 1024;
+const BACKUP_DISK_WARNING_PERCENT = 10;
+const BACKUP_DISK_CRITICAL_PERCENT = 5;
+const BACKUP_INODE_WARNING_PERCENT = 10;
+const BACKUP_INODE_CRITICAL_PERCENT = 5;
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -114,15 +186,11 @@ function monthKey(date: Date): string {
  * - Monthly tier: keep the NEWEST backup per calendar month for `monthlyMonths` months
  * - Everything else is deleted
  */
-function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
-  if (!existsSync(backupDir)) return 0;
+type BackupEntry = { name: string; fullPath: string; sizeBytes: number; mtimeMs: number };
+type BackupRetentionPlanEntry = BackupEntry & { tier: BackupRetentionTier; retained: boolean };
 
-  const now = Date.now();
-  const dailyCutoff = now - Math.max(1, retention.dailyDays) * 24 * 60 * 60 * 1000;
-  const weeklyCutoff = now - Math.max(1, retention.weeklyWeeks) * 7 * 24 * 60 * 60 * 1000;
-  const monthlyCutoff = now - Math.max(1, retention.monthlyMonths) * 30 * 24 * 60 * 60 * 1000;
-
-  type BackupEntry = { name: string; fullPath: string; mtimeMs: number };
+function listBackupEntries(backupDir: string, filenamePrefix: string): BackupEntry[] {
+  if (!existsSync(backupDir)) return [];
   const entries: BackupEntry[] = [];
 
   for (const name of readdirSync(backupDir)) {
@@ -130,19 +198,33 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
     if (!name.endsWith(".sql") && !name.endsWith(".sql.gz")) continue;
     const fullPath = resolve(backupDir, name);
     const stat = statSync(fullPath);
-    entries.push({ name, fullPath, mtimeMs: stat.mtimeMs });
+    if (!stat.isFile()) continue;
+    entries.push({ name, fullPath, sizeBytes: stat.size, mtimeMs: stat.mtimeMs });
   }
 
-  // Sort newest first so the first entry per week/month bucket is the one we keep
   entries.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return entries;
+}
+
+function buildRetentionPlan(
+  entries: BackupEntry[],
+  retention: BackupRetentionPolicy,
+  now: number = Date.now(),
+): BackupRetentionPlanEntry[] {
+  const dailyCutoff = now - Math.max(1, retention.dailyDays) * 24 * 60 * 60 * 1000;
+  const weeklyCutoff = now - Math.max(1, retention.weeklyWeeks) * 7 * 24 * 60 * 60 * 1000;
+  const monthlyCutoff = now - Math.max(1, retention.monthlyMonths) * 30 * 24 * 60 * 60 * 1000;
 
   const keepWeekBuckets = new Set<string>();
   const keepMonthBuckets = new Set<string>();
-  const toDelete: string[] = [];
+  const plan: BackupRetentionPlanEntry[] = [];
 
   for (const entry of entries) {
     // Daily tier — keep everything within dailyDays
-    if (entry.mtimeMs >= dailyCutoff) continue;
+    if (entry.mtimeMs >= dailyCutoff) {
+      plan.push({ ...entry, tier: "daily", retained: true });
+      continue;
+    }
 
     const date = new Date(entry.mtimeMs);
     const week = isoWeekKey(date);
@@ -151,9 +233,10 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
     // Weekly tier — keep newest per calendar week
     if (entry.mtimeMs >= weeklyCutoff) {
       if (keepWeekBuckets.has(week)) {
-        toDelete.push(entry.fullPath);
+        plan.push({ ...entry, tier: "weekly", retained: false });
       } else {
         keepWeekBuckets.add(week);
+        plan.push({ ...entry, tier: "weekly", retained: true });
       }
       continue;
     }
@@ -161,22 +244,176 @@ function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, fi
     // Monthly tier — keep newest per calendar month
     if (entry.mtimeMs >= monthlyCutoff) {
       if (keepMonthBuckets.has(month)) {
-        toDelete.push(entry.fullPath);
+        plan.push({ ...entry, tier: "monthly", retained: false });
       } else {
         keepMonthBuckets.add(month);
+        plan.push({ ...entry, tier: "monthly", retained: true });
       }
       continue;
     }
 
     // Beyond all retention tiers — delete
-    toDelete.push(entry.fullPath);
+    plan.push({ ...entry, tier: "expired", retained: false });
   }
 
-  for (const filePath of toDelete) {
-    unlinkSync(filePath);
+  return plan;
+}
+
+function pruneOldBackups(backupDir: string, retention: BackupRetentionPolicy, filenamePrefix: string): number {
+  const plan = buildRetentionPlan(listBackupEntries(backupDir, filenamePrefix), retention);
+  const toDelete = plan.filter((entry) => !entry.retained);
+
+  for (const { fullPath } of toDelete) {
+    unlinkSync(fullPath);
   }
 
   return toDelete.length;
+}
+
+function sumBytes(entries: Array<{ sizeBytes: number }>): number {
+  return entries.reduce((total, entry) => total + entry.sizeBytes, 0);
+}
+
+function summarizeTier(entries: BackupRetentionPlanEntry[], tier: BackupRetentionTier): BackupRetentionTierSummary {
+  const tierEntries = entries.filter((entry) => entry.tier === tier && entry.retained);
+  return { count: tierEntries.length, bytes: sumBytes(tierEntries) };
+}
+
+function inspectBackupFilesystem(backupDir: string): BackupFilesystemPressure {
+  const thresholds = {
+    warningAvailableBytes: BACKUP_DISK_WARNING_BYTES,
+    criticalAvailableBytes: BACKUP_DISK_CRITICAL_BYTES,
+    warningAvailablePercent: BACKUP_DISK_WARNING_PERCENT,
+    criticalAvailablePercent: BACKUP_DISK_CRITICAL_PERCENT,
+    warningAvailableInodesPercent: BACKUP_INODE_WARNING_PERCENT,
+    criticalAvailableInodesPercent: BACKUP_INODE_CRITICAL_PERCENT,
+  };
+  try {
+    const stat = statfsSync(backupDir);
+    const totalBytes = stat.blocks * stat.bsize;
+    const availableBytes = stat.bavail * stat.bsize;
+    const availablePercent = totalBytes > 0 ? (availableBytes / totalBytes) * 100 : null;
+    const totalInodes = typeof stat.files === "number" && stat.files > 0 ? stat.files : null;
+    const availableInodes = typeof stat.ffree === "number" ? stat.ffree : null;
+    const availableInodesPercent = totalInodes && availableInodes !== null
+      ? (availableInodes / totalInodes) * 100
+      : null;
+    const warnings: string[] = [];
+    let status: BackupFilesystemPressure["status"] = "ok";
+
+    const mark = (next: "warning" | "critical", message: string) => {
+      warnings.push(message);
+      if (next === "critical" || status === "ok") status = next;
+    };
+
+    if (availableBytes <= BACKUP_DISK_CRITICAL_BYTES) {
+      mark("critical", "available backup-disk bytes are below the critical threshold");
+    } else if (availableBytes <= BACKUP_DISK_WARNING_BYTES) {
+      mark("warning", "available backup-disk bytes are below the warning threshold");
+    }
+    if (availablePercent !== null && availablePercent <= BACKUP_DISK_CRITICAL_PERCENT) {
+      mark("critical", "available backup-disk percent is below the critical threshold");
+    } else if (availablePercent !== null && availablePercent <= BACKUP_DISK_WARNING_PERCENT) {
+      mark("warning", "available backup-disk percent is below the warning threshold");
+    }
+    if (availableInodesPercent !== null && availableInodesPercent <= BACKUP_INODE_CRITICAL_PERCENT) {
+      mark("critical", "available backup inode percent is below the critical threshold");
+    } else if (availableInodesPercent !== null && availableInodesPercent <= BACKUP_INODE_WARNING_PERCENT) {
+      mark("warning", "available backup inode percent is below the warning threshold");
+    }
+
+    return {
+      path: backupDir,
+      status,
+      totalBytes,
+      availableBytes,
+      availablePercent,
+      totalInodes,
+      availableInodes,
+      availableInodesPercent,
+      thresholds,
+      warnings,
+    };
+  } catch (error) {
+    return {
+      path: backupDir,
+      status: "unknown",
+      totalBytes: null,
+      availableBytes: null,
+      availablePercent: null,
+      totalInodes: null,
+      availableInodes: null,
+      availableInodesPercent: null,
+      thresholds,
+      warnings: [`filesystem pressure unavailable: ${error instanceof Error ? error.message : String(error)}`],
+    };
+  }
+}
+
+export function analyzeBackupDirectory(
+  backupDir: string,
+  retention: BackupRetentionPolicy,
+  filenamePrefix: string = "paperclip",
+  now: Date = new Date(),
+): BackupObservabilityReport {
+  const plan = buildRetentionPlan(listBackupEntries(backupDir, filenamePrefix), retention, now.getTime());
+  const retained = plan.filter((entry) => entry.retained);
+  const pruneCandidates = plan.filter((entry) => !entry.retained);
+  const latest = plan[0] ?? null;
+  const previous = plan[1] ?? null;
+  const growthFromPreviousBytes = latest && previous ? latest.sizeBytes - previous.sizeBytes : null;
+  const growthFromPreviousPercent =
+    growthFromPreviousBytes !== null && previous && previous.sizeBytes > 0
+      ? (growthFromPreviousBytes / previous.sizeBytes) * 100
+      : null;
+  const elapsedDays = latest && previous
+    ? Math.max((latest.mtimeMs - previous.mtimeMs) / (24 * 60 * 60 * 1000), 1 / 24)
+    : null;
+  const growthPerDayBytes = growthFromPreviousBytes !== null && elapsedDays !== null
+    ? growthFromPreviousBytes / elapsedDays
+    : null;
+  const retainedBytes = sumBytes(retained);
+  const projectedAddedBytes = growthPerDayBytes === null ? null : growthPerDayBytes * 7;
+
+  return {
+    generatedAt: now.toISOString(),
+    backupDir,
+    filenamePrefix,
+    retention,
+    totals: {
+      count: plan.length,
+      bytes: sumBytes(plan),
+      retainedCount: retained.length,
+      retainedBytes,
+      pruneCandidateCount: pruneCandidates.length,
+      pruneCandidateBytes: sumBytes(pruneCandidates),
+    },
+    tiers: {
+      daily: summarizeTier(plan, "daily"),
+      weekly: summarizeTier(plan, "weekly"),
+      monthly: summarizeTier(plan, "monthly"),
+      expired: { count: pruneCandidates.length, bytes: sumBytes(pruneCandidates) },
+    },
+    latest: latest
+      ? {
+        name: latest.name,
+        fullPath: latest.fullPath,
+        sizeBytes: latest.sizeBytes,
+        mtime: new Date(latest.mtimeMs).toISOString(),
+        tier: latest.tier,
+        growthFromPreviousBytes,
+        growthFromPreviousPercent,
+      }
+      : null,
+    projection: {
+      windowDays: 7,
+      basis: growthPerDayBytes === null ? "insufficient_history" : "latest_growth_rate",
+      growthPerDayBytes,
+      projectedAddedBytes,
+      projectedRetainedBytes: projectedAddedBytes === null ? null : retainedBytes + projectedAddedBytes,
+    },
+    filesystem: inspectBackupFilesystem(backupDir),
+  };
 }
 
 function formatBackupSize(sizeBytes: number): string {
@@ -551,10 +788,12 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
         const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+        const observability = analyzeBackupDirectory(opts.backupDir, retention, filenamePrefix);
         return {
           backupFile,
           sizeBytes,
           prunedCount,
+          observability,
         };
       } catch (error) {
         if (existsSync(backupFile)) {
@@ -963,11 +1202,13 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     const sizeBytes = statSync(backupFile).size;
     const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+    const observability = analyzeBackupDirectory(opts.backupDir, retention, filenamePrefix);
 
     return {
       backupFile,
       sizeBytes,
       prunedCount,
+      observability,
     };
   } catch (error) {
     await writer.abort();

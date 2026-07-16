@@ -8,6 +8,7 @@ export type InstanceDatabaseBackupRunResult = RunDatabaseBackupResult & {
   trigger: InstanceDatabaseBackupTrigger;
   backupDir: string;
   retention: BackupRetentionPolicy;
+  retentionSource: "instance-settings-db";
   startedAt: string;
   finishedAt: string;
   durationMs: number;
