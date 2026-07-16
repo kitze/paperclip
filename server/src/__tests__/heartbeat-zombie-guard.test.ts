@@ -4,6 +4,7 @@ import {
   filterZombieCoalesceTarget,
   normalizeQueueAdmissionCeiling,
   providerAccountAdmissionKey,
+  resolveQueueAdmissionAvailability,
 } from "../services/heartbeat.ts";
 
 // ---------------------------------------------------------------------------
@@ -150,5 +151,60 @@ describe("queue admission helpers", () => {
       adapterType: "process",
       adapterConfig: {},
     })).toBe("process:process:default");
+  });
+
+  it("caps a batch claim by remaining company and provider/account capacity", () => {
+    expect(resolveQueueAdmissionAvailability({
+      requestedSlots: 5,
+      companyActiveRunCeiling: 18,
+      providerAccountActiveRunCeiling: 8,
+      companyActiveRunCount: 17,
+      providerAccountActiveRunCount: 4,
+      providerAccountKey: "codex_local:openai:default",
+    })).toEqual({ availableSlots: 1, backpressure: null });
+
+    expect(resolveQueueAdmissionAvailability({
+      requestedSlots: 5,
+      companyActiveRunCeiling: 18,
+      providerAccountActiveRunCeiling: 8,
+      companyActiveRunCount: 12,
+      providerAccountActiveRunCount: 7,
+      providerAccountKey: "codex_local:openai:default",
+    })).toEqual({ availableSlots: 1, backpressure: null });
+  });
+
+  it("reports backpressure only when no admission capacity remains", () => {
+    expect(resolveQueueAdmissionAvailability({
+      requestedSlots: 5,
+      companyActiveRunCeiling: 18,
+      providerAccountActiveRunCeiling: 8,
+      companyActiveRunCount: 18,
+      providerAccountActiveRunCount: 4,
+      providerAccountKey: "codex_local:openai:default",
+    })).toEqual({
+      availableSlots: 0,
+      backpressure: {
+        reason: "company_active_run_ceiling",
+        observed: 18,
+        limit: 18,
+      },
+    });
+
+    expect(resolveQueueAdmissionAvailability({
+      requestedSlots: 5,
+      companyActiveRunCeiling: 18,
+      providerAccountActiveRunCeiling: 8,
+      companyActiveRunCount: 12,
+      providerAccountActiveRunCount: 8,
+      providerAccountKey: "codex_local:openai:default",
+    })).toEqual({
+      availableSlots: 0,
+      backpressure: {
+        reason: "provider_account_active_run_ceiling",
+        observed: 8,
+        limit: 8,
+        providerAccountKey: "codex_local:openai:default",
+      },
+    });
   });
 });

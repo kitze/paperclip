@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -667,6 +667,313 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       expect(mockAdapterExecute.mock.calls.length).toBeGreaterThanOrEqual(2);
     } finally {
       finishFirstRun();
+    }
+  }, 40_000);
+
+  it("caps batch queued-run claims by remaining provider/account admission capacity", async () => {
+    const companyId = randomUUID();
+    const targetAgentId = randomUUID();
+    const activeAgentIds = Array.from({ length: 7 }, () => randomUUID());
+    const queuedIssueIds = Array.from({ length: 5 }, () => randomUUID());
+    const queuedWakeupRequestIds = queuedIssueIds.map(() => randomUUID());
+    const queuedRunIds = queuedIssueIds.map(() => randomUUID());
+    const activeRunIds = activeAgentIds.map(() => randomUUID());
+    let releaseClaimedRun!: () => void;
+    const claimedRunReleased = new Promise<void>((resolve) => {
+      releaseClaimedRun = resolve;
+    });
+    const previousProviderCeiling = process.env.PAPERCLIP_HEARTBEAT_PROVIDER_ACCOUNT_ACTIVE_RUN_CEILING;
+    const previousCompanyCeiling = process.env.PAPERCLIP_HEARTBEAT_COMPANY_ACTIVE_RUN_CEILING;
+
+    process.env.PAPERCLIP_HEARTBEAT_PROVIDER_ACCOUNT_ACTIVE_RUN_CEILING = "8";
+    process.env.PAPERCLIP_HEARTBEAT_COMPANY_ACTIVE_RUN_CEILING = "18";
+    mockAdapterExecute.mockImplementation(async () => {
+      await claimedRunReleased;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Admission-capped queued run completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      {
+        id: targetAgentId,
+        companyId,
+        name: "BatchRunner",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: { provider: "openai", organizationId: "org_batch" },
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 5,
+          },
+        },
+        permissions: {},
+      },
+      ...activeAgentIds.map((agentId, index) => ({
+        id: agentId,
+        companyId,
+        name: `ActiveRunner${index + 1}`,
+        role: "engineer",
+        status: "running",
+        adapterType: "codex_local",
+        adapterConfig: { provider: "openai", organizationId: "org_batch" },
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 5,
+          },
+        },
+        permissions: {},
+      })),
+    ]);
+    await db.insert(issues).values(queuedIssueIds.map((issueId, index) => ({
+      id: issueId,
+      companyId,
+      title: `Queued batch task ${index + 1}`,
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: targetAgentId,
+      responsibleUserId: "responsible-user",
+    })));
+    await db.insert(agentWakeupRequests).values(queuedWakeupRequestIds.map((wakeupRequestId, index) => ({
+      id: wakeupRequestId,
+      companyId,
+      agentId: targetAgentId,
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: queuedIssueIds[index] },
+      status: "queued",
+    })));
+    await db.insert(heartbeatRuns).values([
+      ...activeRunIds.map((runId, index) => ({
+        id: runId,
+        companyId,
+        agentId: activeAgentIds[index],
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        wakeupRequestId: null,
+        contextSnapshot: {},
+        startedAt: new Date(),
+      })),
+      ...queuedRunIds.map((runId, index) => ({
+        id: runId,
+        companyId,
+        agentId: targetAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: queuedWakeupRequestIds[index],
+        contextSnapshot: {
+          issueId: queuedIssueIds[index],
+          wakeReason: "issue_assigned",
+        },
+      })),
+    ]);
+    for (let index = 0; index < queuedWakeupRequestIds.length; index += 1) {
+      await db
+        .update(agentWakeupRequests)
+        .set({ runId: queuedRunIds[index] })
+        .where(eq(agentWakeupRequests.id, queuedWakeupRequestIds[index]));
+    }
+
+    try {
+      await heartbeat.resumeQueuedRuns();
+
+      const oneRunClaimed = await waitForCondition(async () => {
+        const [{ count }] = await db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(heartbeatRuns)
+          .where(and(eq(heartbeatRuns.agentId, targetAgentId), eq(heartbeatRuns.status, "running")));
+        return Number(count ?? 0) === 1;
+      });
+      expect(oneRunClaimed).toBe(true);
+
+      const targetRunStatuses = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, queuedRunIds))
+        .orderBy(heartbeatRuns.createdAt);
+      expect(targetRunStatuses.filter((run) => run.status === "running")).toHaveLength(1);
+      expect(targetRunStatuses.filter((run) => run.status === "queued")).toHaveLength(4);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseClaimedRun();
+      process.env.PAPERCLIP_HEARTBEAT_PROVIDER_ACCOUNT_ACTIVE_RUN_CEILING = previousProviderCeiling;
+      process.env.PAPERCLIP_HEARTBEAT_COMPANY_ACTIVE_RUN_CEILING = previousCompanyCeiling;
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+        .where(inArray(heartbeatRuns.id, [...activeRunIds, ...queuedRunIds]));
+    }
+  }, 40_000);
+
+  it("serializes concurrent queued-run claimers so provider/account ceilings cannot be overshot", async () => {
+    const companyId = randomUUID();
+    const targetAgentIds = [randomUUID(), randomUUID()];
+    const activeAgentIds = Array.from({ length: 7 }, () => randomUUID());
+    const queuedIssueIds = Array.from({ length: 10 }, () => randomUUID());
+    const queuedWakeupRequestIds = queuedIssueIds.map(() => randomUUID());
+    const queuedRunIds = queuedIssueIds.map(() => randomUUID());
+    const activeRunIds = activeAgentIds.map(() => randomUUID());
+    let releaseClaimedRun!: () => void;
+    const claimedRunReleased = new Promise<void>((resolve) => {
+      releaseClaimedRun = resolve;
+    });
+    const previousProviderCeiling = process.env.PAPERCLIP_HEARTBEAT_PROVIDER_ACCOUNT_ACTIVE_RUN_CEILING;
+    const previousCompanyCeiling = process.env.PAPERCLIP_HEARTBEAT_COMPANY_ACTIVE_RUN_CEILING;
+
+    process.env.PAPERCLIP_HEARTBEAT_PROVIDER_ACCOUNT_ACTIVE_RUN_CEILING = "8";
+    process.env.PAPERCLIP_HEARTBEAT_COMPANY_ACTIVE_RUN_CEILING = "18";
+    mockAdapterExecute.mockImplementation(async () => {
+      await claimedRunReleased;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Concurrent admission-capped queued run completed.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values([
+      ...targetAgentIds.map((agentId, index) => ({
+        id: agentId,
+        companyId,
+        name: `ConcurrentBatchRunner${index + 1}`,
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: { provider: "openai", organizationId: "org_concurrent" },
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 5,
+          },
+        },
+        permissions: {},
+      })),
+      ...activeAgentIds.map((agentId, index) => ({
+        id: agentId,
+        companyId,
+        name: `ConcurrentActiveRunner${index + 1}`,
+        role: "engineer",
+        status: "running",
+        adapterType: "codex_local",
+        adapterConfig: { provider: "openai", organizationId: "org_concurrent" },
+        runtimeConfig: {
+          heartbeat: {
+            wakeOnDemand: true,
+            maxConcurrentRuns: 5,
+          },
+        },
+        permissions: {},
+      })),
+    ]);
+    await db.insert(issues).values(queuedIssueIds.map((issueId, index) => ({
+      id: issueId,
+      companyId,
+      title: `Concurrent queued batch task ${index + 1}`,
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: targetAgentIds[index < 5 ? 0 : 1],
+      responsibleUserId: "responsible-user",
+    })));
+    await db.insert(agentWakeupRequests).values(queuedWakeupRequestIds.map((wakeupRequestId, index) => ({
+      id: wakeupRequestId,
+      companyId,
+      agentId: targetAgentIds[index < 5 ? 0 : 1],
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_assigned",
+      payload: { issueId: queuedIssueIds[index] },
+      status: "queued",
+    })));
+    await db.insert(heartbeatRuns).values([
+      ...activeRunIds.map((runId, index) => ({
+        id: runId,
+        companyId,
+        agentId: activeAgentIds[index],
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "running",
+        wakeupRequestId: null,
+        contextSnapshot: {},
+        startedAt: new Date(),
+      })),
+      ...queuedRunIds.map((runId, index) => ({
+        id: runId,
+        companyId,
+        agentId: targetAgentIds[index < 5 ? 0 : 1],
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: queuedWakeupRequestIds[index],
+        contextSnapshot: {
+          issueId: queuedIssueIds[index],
+          wakeReason: "issue_assigned",
+        },
+      })),
+    ]);
+    for (let index = 0; index < queuedWakeupRequestIds.length; index += 1) {
+      await db
+        .update(agentWakeupRequests)
+        .set({ runId: queuedRunIds[index] })
+        .where(eq(agentWakeupRequests.id, queuedWakeupRequestIds[index]));
+    }
+
+    try {
+      await Promise.all([heartbeat.resumeQueuedRuns(), heartbeat.resumeQueuedRuns()]);
+
+      const oneRunClaimed = await waitForCondition(async () => {
+        const [{ count }] = await db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(heartbeatRuns)
+          .where(and(inArray(heartbeatRuns.agentId, targetAgentIds), eq(heartbeatRuns.status, "running")));
+        return Number(count ?? 0) === 1;
+      });
+      expect(oneRunClaimed).toBe(true);
+
+      const targetRunStatuses = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, queuedRunIds));
+      expect(targetRunStatuses.filter((run) => run.status === "running")).toHaveLength(1);
+      expect(targetRunStatuses.filter((run) => run.status === "queued")).toHaveLength(9);
+      expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
+    } finally {
+      releaseClaimedRun();
+      process.env.PAPERCLIP_HEARTBEAT_PROVIDER_ACCOUNT_ACTIVE_RUN_CEILING = previousProviderCeiling;
+      process.env.PAPERCLIP_HEARTBEAT_COMPANY_ACTIVE_RUN_CEILING = previousCompanyCeiling;
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+        .where(inArray(heartbeatRuns.id, [...activeRunIds, ...queuedRunIds]));
     }
   }, 40_000);
 

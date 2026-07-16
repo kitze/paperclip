@@ -2672,6 +2672,52 @@ export function providerAccountAdmissionKey(input: {
   return `${adapterType}:${provider}:${account}`;
 }
 
+export function resolveQueueAdmissionAvailability(input: {
+  requestedSlots: number;
+  companyActiveRunCeiling: number;
+  providerAccountActiveRunCeiling: number;
+  companyActiveRunCount: number;
+  providerAccountActiveRunCount: number;
+  providerAccountKey?: string | null;
+}) {
+  const requestedSlots = Math.max(0, Math.floor(input.requestedSlots));
+  const companyAvailable = Math.max(0, input.companyActiveRunCeiling - input.companyActiveRunCount);
+  const providerAccountAvailable = Math.max(
+    0,
+    input.providerAccountActiveRunCeiling - input.providerAccountActiveRunCount,
+  );
+  const availableSlots = Math.min(requestedSlots, companyAvailable, providerAccountAvailable);
+
+  if (availableSlots > 0) {
+    return { availableSlots, backpressure: null };
+  }
+
+  if (companyAvailable <= 0) {
+    return {
+      availableSlots: 0,
+      backpressure: {
+        reason: "company_active_run_ceiling" as const,
+        observed: input.companyActiveRunCount,
+        limit: input.companyActiveRunCeiling,
+      },
+    };
+  }
+
+  if (providerAccountAvailable <= 0) {
+    return {
+      availableSlots: 0,
+      backpressure: {
+        reason: "provider_account_active_run_ceiling" as const,
+        observed: input.providerAccountActiveRunCount,
+        limit: input.providerAccountActiveRunCeiling,
+        providerAccountKey: input.providerAccountKey ?? null,
+      },
+    };
+  }
+
+  return { availableSlots: 0, backpressure: null };
+}
+
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
@@ -8930,7 +8976,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
-  async function getQueueAdmissionBackpressure(agent: typeof agents.$inferSelect) {
+  async function withQueueAdmissionStartLock<T>(companyId: string, fn: () => Promise<T>) {
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${"heartbeat_queue_admission:" + companyId}))`);
+      return fn();
+    });
+  }
+
+  async function getQueueAdmissionAvailability(agent: typeof agents.$inferSelect, requestedSlots: number) {
     const policy = queueAdmissionPolicy();
     const activeRuns = await db
       .select({
@@ -8941,14 +8994,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
       .where(and(eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.status, "running")));
-
-    if (activeRuns.length >= policy.companyActiveRunCeiling) {
-      return {
-        reason: "company_active_run_ceiling" as const,
-        observed: activeRuns.length,
-        limit: policy.companyActiveRunCeiling,
-      };
-    }
 
     const targetKey = providerAccountAdmissionKey({
       adapterType: agent.adapterType,
@@ -8961,16 +9006,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }) === targetKey
     ).length;
 
-    if (providerAccountActive >= policy.providerAccountActiveRunCeiling) {
-      return {
-        reason: "provider_account_active_run_ceiling" as const,
-        observed: providerAccountActive,
-        limit: policy.providerAccountActiveRunCeiling,
-        providerAccountKey: targetKey,
-      };
-    }
-
-    return null;
+    return resolveQueueAdmissionAvailability({
+      requestedSlots,
+      companyActiveRunCeiling: policy.companyActiveRunCeiling,
+      providerAccountActiveRunCeiling: policy.providerAccountActiveRunCeiling,
+      companyActiveRunCount: activeRuns.length,
+      providerAccountActiveRunCount: providerAccountActive,
+      providerAccountKey: targetKey,
+    });
   }
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
@@ -9939,19 +9982,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         return [];
       }
+      return withQueueAdmissionStartLock(agent.companyId, async () => {
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
-      if (availableSlots <= 0) return [];
+      const agentAvailableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+      if (agentAvailableSlots <= 0) return [];
 
-      const backpressure = await getQueueAdmissionBackpressure(agent);
-      if (backpressure) {
+      const admission = await getQueueAdmissionAvailability(agent, agentAvailableSlots);
+      if (admission.backpressure) {
         logger.info(
-          { agentId, companyId: agent.companyId, ...backpressure },
+          { agentId, companyId: agent.companyId, ...admission.backpressure },
           "queued heartbeat start deferred by admission backpressure",
         );
         return [];
       }
+      const availableSlots = admission.availableSlots;
+      if (availableSlots <= 0) return [];
 
       const queuedRuns = await db
         .select()
@@ -10012,6 +10058,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
       return claimedRuns;
+      });
     });
   }
 
