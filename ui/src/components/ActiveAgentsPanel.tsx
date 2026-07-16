@@ -180,7 +180,6 @@ const AgentRunCard = memo(function AgentRunCard({
   issue,
   transcript,
   hasOutput,
-  isActive,
   className,
 }: {
   companyId: string;

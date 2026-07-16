@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 
-import { act, type ReactNode } from "react";
+import type { ReactNode } from "react";
+import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { LiveRunForIssue } from "../api/heartbeats";
 import { ActiveAgentsPanel } from "./ActiveAgentsPanel";
 
 const mockHeartbeatsApi = vi.hoisted(() => ({
@@ -12,6 +14,11 @@ const mockHeartbeatsApi = vi.hoisted(() => ({
 
 const mockIssuesApi = vi.hoisted(() => ({
   get: vi.fn(),
+}));
+
+const mockLiveRunTranscripts = vi.hoisted(() => ({
+  transcriptByRun: new Map(),
+  hasOutputForRun: vi.fn(() => false),
 }));
 
 vi.mock("@/lib/router", () => ({
@@ -39,14 +46,23 @@ vi.mock("./RunChatSurface", () => ({
 }));
 
 vi.mock("./transcript/useLiveRunTranscripts", () => ({
-  useLiveRunTranscripts: () => ({
-    transcriptByRun: new Map(),
-    hasOutputForRun: () => false,
-  }),
+  useLiveRunTranscripts: () => mockLiveRunTranscripts,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+declare global {
+  var IS_REACT_ACT_ENVIRONMENT: boolean | undefined;
+}
+
+globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+
+async function act(callback: () => void | Promise<void>) {
+  let result: void | Promise<void> = undefined;
+  flushSync(() => {
+    result = callback();
+  });
+  await result;
+  await Promise.resolve();
+}
 
 async function flushReact() {
   await act(async () => {
@@ -69,7 +85,7 @@ async function waitForMicrotaskAssertion(assertion: () => void, attempts = 20) {
   throw lastError;
 }
 
-function createRun(index: number, overrides: Record<string, unknown> = {}) {
+function createRun(index: number, overrides: Partial<LiveRunForIssue> = {}): LiveRunForIssue {
   return {
     id: `run-${index}`,
     status: "running",
@@ -126,7 +142,9 @@ describe("ActiveAgentsPanel", () => {
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
-    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([1, 2, 3, 4, 5].map(createRun));
+    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue(
+      Array.from({ length: 5 }, (_, index) => createRun(index + 1)),
+    );
     mockIssuesApi.get.mockRejectedValue(new Error("Issue not found"));
   });
 
@@ -134,6 +152,8 @@ describe("ActiveAgentsPanel", () => {
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
+    mockLiveRunTranscripts.transcriptByRun = new Map();
+    mockLiveRunTranscripts.hasOutputForRun = vi.fn(() => false);
   });
 
   it("links hidden active/recent runs to the full live dashboard", async () => {
@@ -275,6 +295,112 @@ describe("ActiveAgentsPanel", () => {
     expect(container.textContent).toContain("Queued capacity");
     expect(container.textContent).toContain("Canceled");
     expect(container.textContent).not.toContain("Live now");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("classifies detached, queued, no-output, stale-output, terminal, and comment-woken runs", async () => {
+    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([
+      createRun(1, {
+        id: "detached-useful-run",
+        issueId: null,
+        status: "running",
+        lastOutputBytes: 64,
+        logBytes: 128,
+        lastUsefulActionAt: "2026-04-24T12:00:01.000Z",
+      }),
+      createRun(2, {
+        id: "queued-run",
+        status: "queued",
+        startedAt: null,
+        logBytes: 0,
+        lastOutputBytes: 0,
+        lastUsefulActionAt: null,
+      }),
+      createRun(3, {
+        id: "no-output-run",
+        status: "running",
+        logBytes: 0,
+        lastOutputBytes: 0,
+        lastUsefulActionAt: null,
+        lastAssistantSnippet: null,
+      }),
+      createRun(4, {
+        id: "stale-output-terminal-run",
+        status: "failed",
+        finishedAt: "2026-04-24T12:05:00.000Z",
+        logBytes: 4096,
+        lastOutputBytes: 2048,
+        lastUsefulActionAt: "2026-04-24T11:55:00.000Z",
+      }),
+      createRun(5, {
+        id: "comment-woken-replacement-run",
+        status: "running",
+        triggerDetail: "comment",
+        contextWakeCommentId: "comment-wake-1",
+        logBytes: 0,
+        lastOutputBytes: 0,
+        lastUsefulActionAt: null,
+        lastAssistantSnippet: null,
+      }),
+    ]);
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ActiveAgentsPanel companyId="company-1" cardLimit={5} />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.textContent?.match(/Useful labor now/g)).toHaveLength(1);
+    expect(container.textContent).toContain("Queued capacity");
+    expect(container.textContent?.match(/No output yet/g)).toHaveLength(2);
+    expect(container.textContent).toContain("Finished");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("deduplicates issue lookups for duplicate visible issue runs", async () => {
+    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([
+      createIssueRun(1, "65274215-0000-4000-8000-000000000000"),
+      createIssueRun(2, "65274215-0000-4000-8000-000000000000"),
+    ]);
+    mockIssuesApi.get.mockResolvedValue(createIssue(
+      "65274215-0000-4000-8000-000000000000",
+      "PAP-3562",
+      "Phase 4B: Implement LLM Wiki distillation UI",
+    ));
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ActiveAgentsPanel companyId="company-1" />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    await waitForMicrotaskAssertion(() => {
+      expect(mockIssuesApi.get).toHaveBeenCalledTimes(1);
+      expect(mockIssuesApi.get).toHaveBeenCalledWith("65274215-0000-4000-8000-000000000000");
+      expect(container.textContent?.match(/PAP-3562 - Phase 4B/g)).toHaveLength(2);
+    });
 
     await act(async () => {
       root.unmount();
