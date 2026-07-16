@@ -1615,9 +1615,11 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
   const persistedCwd = readNonEmptyString(input.persistedExecutionWorkspace?.cwd);
   const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
+  const resolvedWorkspaceHasProjectLink =
+    Boolean(input.resolvedWorkspace.projectId) && Boolean(input.resolvedWorkspace.workspaceId);
   const workspaceExpectation =
     Boolean(issue.projectWorkspaceId) ||
-    Boolean(input.resolvedWorkspace.workspaceId) ||
+    resolvedWorkspaceHasProjectLink ||
     input.executionWorkspace.strategy === "git_worktree";
 
   const fail = (reason: string, message: string, extra: Record<string, unknown> = {}) => {
@@ -1683,7 +1685,9 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
     );
   }
 
-  const expectedProjectWorkspaceId = issue.projectWorkspaceId ?? input.resolvedWorkspace.workspaceId ?? null;
+  const expectedProjectWorkspaceId =
+    issue.projectWorkspaceId ??
+    (resolvedWorkspaceHasProjectLink ? input.resolvedWorkspace.workspaceId : null);
   if (
     expectedProjectWorkspaceId &&
     input.persistedExecutionWorkspace &&
