@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
-import { ensureRemoteOpenCodeModelConfiguredAndAvailable } from "./execute.js";
+import { ensureRemoteOpenCodeModelConfiguredAndAvailable, execute } from "./execute.js";
 
 describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
   afterEach(() => {
@@ -58,5 +61,65 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
         graceSec: 5,
       }),
     ).rejects.toThrow();
+  });
+});
+
+describe("execute", () => {
+  it("surfaces OpenCode provider rate limits as transient upstream failures", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-rate-limit-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "opencode");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(
+      commandPath,
+      [
+        "#!/bin/sh",
+        "if [ \"$1\" = \"models\" ]; then",
+        "  echo 'openai/gpt-5.1-codex-mini'",
+        "  exit 0",
+        "fi",
+        "echo '{\"type\":\"error\",\"message\":\"Provider returned 429 Too Many Requests: rate limit exceeded\"}'",
+        "exit 1",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(commandPath, 0o755);
+
+    try {
+      const result = await execute({
+        runId: "run-opencode-rate-limit",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "OpenCode Coder",
+          adapterType: "opencode_local",
+          adapterConfig: {},
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          command: commandPath,
+          cwd: workspace,
+          model: "openai/gpt-5.1-codex-mini",
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("opencode_transient_upstream");
+      expect(result.errorFamily).toBe("transient_upstream");
+      expect(result.errorMessage).toContain("rate limit exceeded");
+      expect(result.resultJson?.errorFamily).toBe("transient_upstream");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });

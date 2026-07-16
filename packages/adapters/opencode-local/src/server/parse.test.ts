@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+import {
+  isOpenCodeTransientUpstreamError,
+  isOpenCodeUnknownSessionError,
+  parseOpenCodeJsonl,
+} from "./parse.js";
 
 describe("parseOpenCodeJsonl", () => {
   it("parses assistant text, usage, cost, and errors", () => {
@@ -73,5 +77,19 @@ describe("parseOpenCodeJsonl", () => {
     expect(isOpenCodeUnknownSessionError("Session not found: s_123", "")).toBe(true);
     expect(isOpenCodeUnknownSessionError("", "unknown session id")).toBe(true);
     expect(isOpenCodeUnknownSessionError("all good", "")).toBe(false);
+  });
+
+  it("classifies provider rate limits and quota failures as transient", () => {
+    expect(
+      isOpenCodeTransientUpstreamError({
+        stderr: "Provider returned 429 Too Many Requests: rate limit exceeded",
+      }),
+    ).toBe(true);
+    expect(
+      isOpenCodeTransientUpstreamError({
+        errorMessage: "OpenAI provider quota exhausted for this model",
+      }),
+    ).toBe(true);
+    expect(isOpenCodeTransientUpstreamError({ stderr: "ProviderModelNotFoundError" })).toBe(false);
   });
 });

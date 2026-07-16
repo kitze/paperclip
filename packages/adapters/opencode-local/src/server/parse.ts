@@ -99,3 +99,25 @@ export function isOpenCodeUnknownSessionError(stdout: string, stderr: string): b
     haystack,
   );
 }
+
+export function isOpenCodeTransientUpstreamError(input: {
+  stdout?: string;
+  stderr?: string;
+  errorMessage?: string | null;
+}): boolean {
+  const haystack = [input.errorMessage, input.stderr, input.stdout]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n")
+    .toLowerCase();
+  if (!haystack) return false;
+
+  return (
+    /\b429\b/.test(haystack) ||
+    /\brate[-\s]?limit(?:ed|ing)?\b/.test(haystack) ||
+    /\bquota\b/.test(haystack) ||
+    /\busage\s+limit\b/.test(haystack) ||
+    /\bresource[_\s-]?exhausted\b/.test(haystack) ||
+    /\boverloaded\b/.test(haystack) ||
+    /\btoo\s+many\s+requests\b/.test(haystack)
+  );
+}
