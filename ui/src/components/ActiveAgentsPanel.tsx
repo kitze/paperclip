@@ -11,7 +11,7 @@ import {
   deriveActiveRecoveryDisplayState,
   RECOVERY_CHIP_DEFAULT_TONE,
 } from "../lib/recovery-display";
-import { ExternalLink } from "lucide-react";
+import { Activity, CircleDashed, Clock, ExternalLink, History } from "lucide-react";
 import { Identity } from "./Identity";
 import { RunChatSurface } from "./RunChatSurface";
 import { useLiveRunTranscripts } from "./transcript/useLiveRunTranscripts";
@@ -46,8 +46,32 @@ const DASHBOARD_LOG_READ_LIMIT_BYTES = 64_000;
 const DASHBOARD_MAX_CHUNKS_PER_RUN = 40;
 const EMPTY_TRANSCRIPT: TranscriptEntry[] = [];
 
-function isRunActive(run: LiveRunForIssue): boolean {
-  return run.status === "queued" || run.status === "running";
+type LaborRunDisplayState = "useful_live_labor" | "queued_capacity" | "zero_output_run" | "recent_terminal";
+
+function hasUsefulLaborSignal(run: LiveRunForIssue, hasOutput: boolean): boolean {
+  return Boolean(
+    hasOutput ||
+      (typeof run.lastOutputBytes === "number" && run.lastOutputBytes > 0) ||
+      (typeof run.logBytes === "number" && run.logBytes > 0) ||
+      run.lastUsefulActionAt ||
+      run.lastAssistantSnippet,
+  );
+}
+
+function getLaborRunDisplayState(run: LiveRunForIssue, hasOutput: boolean): LaborRunDisplayState {
+  if (run.status === "queued") return "queued_capacity";
+  if (run.status === "running") {
+    return hasUsefulLaborSignal(run, hasOutput) ? "useful_live_labor" : "zero_output_run";
+  }
+  return "recent_terminal";
+}
+
+function getLaborRunStatusText(run: LiveRunForIssue, state: LaborRunDisplayState): string {
+  if (state === "useful_live_labor") return "Useful labor now";
+  if (state === "queued_capacity") return "Queued capacity";
+  if (state === "zero_output_run") return "No output yet";
+  if (run.finishedAt) return `${run.status === "cancelled" ? "Canceled" : "Finished"} ${relativeTime(run.finishedAt)}`;
+  return `Recent ${run.status}`;
 }
 
 interface ActiveAgentsPanelProps {
@@ -134,7 +158,6 @@ export function ActiveAgentsPanel({
               issue={run.issueId ? issueById.get(run.issueId) : undefined}
               transcript={transcriptByRun.get(run.id) ?? EMPTY_TRANSCRIPT}
               hasOutput={hasOutputForRun(run.id)}
-              isActive={isRunActive(run)}
               className={cardClassName}
             />
           ))}
@@ -143,7 +166,7 @@ export function ActiveAgentsPanel({
       {showMoreLink && hiddenRunCount > 0 && (
         <div className="mt-3 flex justify-end text-xs text-muted-foreground">
           <Link to="/dashboard/live" className="hover:text-foreground hover:underline">
-            {hiddenRunCount} more active/recent run{hiddenRunCount === 1 ? "" : "s"}
+            {hiddenRunCount} more dashboard run{hiddenRunCount === 1 ? "" : "s"}
           </Link>
         </div>
       )}
@@ -165,13 +188,22 @@ const AgentRunCard = memo(function AgentRunCard({
   issue?: Issue;
   transcript: TranscriptEntry[];
   hasOutput: boolean;
-  isActive: boolean;
   className?: string;
 }) {
+  const displayState = getLaborRunDisplayState(run, hasOutput);
+  const isUsefulLabor = displayState === "useful_live_labor";
+  const statusText = getLaborRunStatusText(run, displayState);
+  const StatusIcon = displayState === "useful_live_labor"
+    ? Activity
+    : displayState === "queued_capacity"
+      ? Clock
+      : displayState === "zero_output_run"
+        ? CircleDashed
+        : History;
   return (
     <div className={cn(
       "flex h-[320px] flex-col overflow-hidden rounded-xl border shadow-sm",
-      isActive
+      isUsefulLabor
         ? "border-cyan-500/25 bg-cyan-500/[0.04] shadow-[0_16px_40px_rgba(6,182,212,0.08)]"
         : "border-border bg-background/70",
       className,
@@ -180,18 +212,28 @@ const AgentRunCard = memo(function AgentRunCard({
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              {isActive ? (
+              {isUsefulLabor ? (
                 <span className="relative flex h-2.5 w-2.5 shrink-0">
                   <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-400 opacity-70" />
                   <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-cyan-500" />
                 </span>
               ) : (
-                <span className="inline-flex h-2.5 w-2.5 rounded-full bg-muted-foreground/35" />
+                <StatusIcon
+                  className={cn(
+                    "h-3 w-3 shrink-0",
+                    displayState === "queued_capacity"
+                      ? "text-amber-500"
+                      : displayState === "zero_output_run"
+                        ? "text-muted-foreground"
+                        : "text-muted-foreground/70",
+                  )}
+                  aria-hidden
+                />
               )}
               <Identity name={run.agentName} size="sm" className="[&>span:last-child]:!text-[11px]" />
             </div>
             <div className="mt-2 flex items-center gap-2 text-[11px] text-muted-foreground">
-              <span>{isActive ? "Live now" : run.finishedAt ? `Finished ${relativeTime(run.finishedAt)}` : `Started ${relativeTime(run.createdAt)}`}</span>
+              <span>{statusText}</span>
             </div>
           </div>
 
@@ -209,7 +251,7 @@ const AgentRunCard = memo(function AgentRunCard({
               to={`/issues/${issue?.identifier ?? run.issueId}`}
               className={cn(
                 "line-clamp-2 hover:underline",
-                isActive ? "text-cyan-700 dark:text-cyan-300" : "text-muted-foreground hover:text-foreground",
+                isUsefulLabor ? "text-cyan-700 dark:text-cyan-300" : "text-muted-foreground hover:text-foreground",
               )}
               title={issue?.title ? `${issue?.identifier ?? run.issueId.slice(0, 8)} - ${issue.title}` : issue?.identifier ?? run.issueId.slice(0, 8)}
             >

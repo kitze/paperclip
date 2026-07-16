@@ -69,7 +69,7 @@ async function waitForMicrotaskAssertion(assertion: () => void, attempts = 20) {
   throw lastError;
 }
 
-function createRun(index: number) {
+function createRun(index: number, overrides: Record<string, unknown> = {}) {
   return {
     id: `run-${index}`,
     status: "running",
@@ -82,6 +82,10 @@ function createRun(index: number) {
     agentName: `Agent ${index}`,
     adapterType: "codex_local",
     issueId: null,
+    logBytes: 256,
+    lastOutputBytes: 128,
+    lastUsefulActionAt: "2026-04-24T12:00:01.000Z",
+    ...overrides,
   };
 }
 
@@ -153,7 +157,7 @@ describe("ActiveAgentsPanel", () => {
     });
 
     const moreLink = [...container.querySelectorAll("a")].find((anchor) =>
-      anchor.textContent?.includes("more active/recent"),
+      anchor.textContent?.includes("more dashboard"),
     );
     expect(moreLink?.getAttribute("href")).toBe("/dashboard/live");
 
@@ -188,7 +192,7 @@ describe("ActiveAgentsPanel", () => {
       minCount: 50,
       limit: 50,
     });
-    expect(container.textContent).not.toContain("more active/recent");
+    expect(container.textContent).not.toContain("more dashboard");
 
     await act(async () => {
       root.unmount();
@@ -227,6 +231,85 @@ describe("ActiveAgentsPanel", () => {
       expect(issueLink?.textContent).toBe("PAP-3562 - Phase 4B: Implement LLM Wiki distillation UI");
       expect(issueLink?.getAttribute("href")).toBe("/issues/PAP-3562");
     });
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("labels useful labor separately from queued capacity and padded terminal history", async () => {
+    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([
+      createRun(1, { status: "running", lastOutputBytes: 64, logBytes: 128 }),
+      createRun(2, {
+        status: "queued",
+        startedAt: null,
+        logBytes: 0,
+        lastOutputBytes: 0,
+        lastUsefulActionAt: null,
+      }),
+      createRun(3, {
+        status: "cancelled",
+        issueId: null,
+        finishedAt: "2026-04-24T12:05:00.000Z",
+        logBytes: 0,
+        lastOutputBytes: 0,
+        lastUsefulActionAt: null,
+      }),
+    ]);
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ActiveAgentsPanel companyId="company-1" />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("Useful labor now");
+    expect(container.textContent).toContain("Queued capacity");
+    expect(container.textContent).toContain("Canceled");
+    expect(container.textContent).not.toContain("Live now");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("does not present comment-woken zero-output replacement runs as useful live labor", async () => {
+    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([
+      createRun(1, {
+        status: "running",
+        triggerDetail: "comment",
+        contextWakeCommentId: "comment-wake-1",
+        logBytes: 0,
+        lastOutputBytes: 0,
+        lastUsefulActionAt: null,
+        lastAssistantSnippet: null,
+      }),
+    ]);
+
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ActiveAgentsPanel companyId="company-1" />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    expect(container.textContent).toContain("No output yet");
+    expect(container.textContent).not.toContain("Useful labor now");
 
     await act(async () => {
       root.unmount();
