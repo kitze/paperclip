@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   isZombieRun,
   filterZombieCoalesceTarget,
+  normalizeQueueAdmissionCeiling,
+  providerAccountAdmissionKey,
 } from "../services/heartbeat.ts";
 
 // ---------------------------------------------------------------------------
@@ -121,5 +123,32 @@ describe("filterZombieCoalesceTarget", () => {
 
     expect(filterZombieCoalesceTarget(zombie, tracked)).toBeNull();
     expect(filterZombieCoalesceTarget(live, tracked)).toBe(live);
+  });
+});
+
+describe("queue admission helpers", () => {
+  it("defaults invalid active-run ceilings instead of disabling admission", () => {
+    expect(normalizeQueueAdmissionCeiling(undefined, 18)).toBe(18);
+    expect(normalizeQueueAdmissionCeiling("", 18)).toBe(18);
+    expect(normalizeQueueAdmissionCeiling(0, 18)).toBe(18);
+    expect(normalizeQueueAdmissionCeiling(-1, 18)).toBe(18);
+    expect(normalizeQueueAdmissionCeiling(7.8, 18)).toBe(7);
+  });
+
+  it("groups runs by adapter provider and account identity", () => {
+    expect(providerAccountAdmissionKey({
+      adapterType: "codex_local",
+      adapterConfig: { provider: "openai", organizationId: "org_1" },
+    })).toBe("codex_local:openai:org_1");
+
+    expect(providerAccountAdmissionKey({
+      adapterType: "opencode_local",
+      adapterConfig: { provider: "openrouter", apiKeySecretRef: "secret-openrouter-main" },
+    })).toBe("opencode_local:openrouter:secret-openrouter-main");
+
+    expect(providerAccountAdmissionKey({
+      adapterType: "process",
+      adapterConfig: {},
+    })).toBe("process:process:default");
   });
 });

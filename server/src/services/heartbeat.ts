@@ -251,6 +251,8 @@ const MAX_RUN_EVENT_PAYLOAD_DEPTH = 6;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = AGENT_DEFAULT_MAX_CONCURRENT_RUNS;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
+export const HEARTBEAT_COMPANY_ACTIVE_RUN_CEILING_DEFAULT = 18;
+export const HEARTBEAT_PROVIDER_ACCOUNT_ACTIVE_RUN_CEILING_DEFAULT = 8;
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -2637,6 +2639,37 @@ export function filterZombieCoalesceTarget<
   tracked: { has(id: string): boolean },
 ): T | null {
   return target && isZombieRun(target, tracked) ? null : target;
+}
+
+export function normalizeQueueAdmissionCeiling(value: unknown, fallback: number) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const normalized = Math.floor(asNumber(value, fallback));
+  return normalized > 0 ? normalized : fallback;
+}
+
+export function providerAccountAdmissionKey(input: {
+  adapterType: string | null | undefined;
+  adapterConfig: unknown;
+}) {
+  const config = parseObject(input.adapterConfig);
+  const adapterType = readNonEmptyString(input.adapterType) ?? "unknown_adapter";
+  const provider =
+    readNonEmptyString(config.provider) ??
+    readNonEmptyString(config.biller) ??
+    readNonEmptyString(config.vendor) ??
+    adapterType;
+  const account =
+    readNonEmptyString(config.accountId) ??
+    readNonEmptyString(config.account) ??
+    readNonEmptyString(config.organizationId) ??
+    readNonEmptyString(config.organization) ??
+    readNonEmptyString(config.apiKeySecretRef) ??
+    readNonEmptyString(config.apiKeyEnv) ??
+    readNonEmptyString(config.apiBaseUrl) ??
+    readNonEmptyString(config.baseUrl) ??
+    readNonEmptyString(config.url) ??
+    "default";
+  return `${adapterType}:${provider}:${account}`;
 }
 
 export function describeSessionResetReason(
@@ -8884,6 +8917,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return Number(count ?? 0);
   }
 
+  function queueAdmissionPolicy() {
+    return {
+      companyActiveRunCeiling: normalizeQueueAdmissionCeiling(
+        process.env.PAPERCLIP_HEARTBEAT_COMPANY_ACTIVE_RUN_CEILING,
+        HEARTBEAT_COMPANY_ACTIVE_RUN_CEILING_DEFAULT,
+      ),
+      providerAccountActiveRunCeiling: normalizeQueueAdmissionCeiling(
+        process.env.PAPERCLIP_HEARTBEAT_PROVIDER_ACCOUNT_ACTIVE_RUN_CEILING,
+        HEARTBEAT_PROVIDER_ACCOUNT_ACTIVE_RUN_CEILING_DEFAULT,
+      ),
+    };
+  }
+
+  async function getQueueAdmissionBackpressure(agent: typeof agents.$inferSelect) {
+    const policy = queueAdmissionPolicy();
+    const activeRuns = await db
+      .select({
+        runId: heartbeatRuns.id,
+        adapterType: agents.adapterType,
+        adapterConfig: agents.adapterConfig,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(and(eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.status, "running")));
+
+    if (activeRuns.length >= policy.companyActiveRunCeiling) {
+      return {
+        reason: "company_active_run_ceiling" as const,
+        observed: activeRuns.length,
+        limit: policy.companyActiveRunCeiling,
+      };
+    }
+
+    const targetKey = providerAccountAdmissionKey({
+      adapterType: agent.adapterType,
+      adapterConfig: agent.adapterConfig,
+    });
+    const providerAccountActive = activeRuns.filter((run) =>
+      providerAccountAdmissionKey({
+        adapterType: run.adapterType,
+        adapterConfig: run.adapterConfig,
+      }) === targetKey
+    ).length;
+
+    if (providerAccountActive >= policy.providerAccountActiveRunCeiling) {
+      return {
+        reason: "provider_account_active_run_ceiling" as const,
+        observed: providerAccountActive,
+        limit: policy.providerAccountActiveRunCeiling,
+        providerAccountKey: targetKey,
+      };
+    }
+
+    return null;
+  }
+
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -9854,6 +9943,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const runningCount = await countRunningRunsForAgent(agentId);
       const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
       if (availableSlots <= 0) return [];
+
+      const backpressure = await getQueueAdmissionBackpressure(agent);
+      if (backpressure) {
+        logger.info(
+          { agentId, companyId: agent.companyId, ...backpressure },
+          "queued heartbeat start deferred by admission backpressure",
+        );
+        return [];
+      }
 
       const queuedRuns = await db
         .select()
@@ -14082,6 +14180,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     eventPayload?: Record<string, unknown>;
   };
 
+  async function appendPreCancelEvidenceEvent(run: typeof heartbeatRuns.$inferSelect, reason: string, errorCode: string) {
+    if (run.status !== "running") return;
+    const outputSilence = await buildRunOutputSilence(run);
+    const processPidAlive = run.processPid ? isProcessAlive(run.processPid) : null;
+    const processGroupAlive = run.processGroupId ? isProcessGroupAlive(run.processGroupId) : null;
+    await appendRunEvent(run, await nextRunEventSeq(run.id), {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "pre-cancel run evidence captured",
+      payload: {
+        reason,
+        errorCode,
+        runStatus: run.status,
+        startedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
+        processStartedAt: run.processStartedAt ? new Date(run.processStartedAt).toISOString() : null,
+        lastOutputAt: run.lastOutputAt ? new Date(run.lastOutputAt).toISOString() : null,
+        lastOutputSeq: run.lastOutputSeq ?? null,
+        lastOutputStream: run.lastOutputStream ?? null,
+        outputSilence,
+        processPid: run.processPid ?? null,
+        processPidAlive,
+        processGroupId: run.processGroupId ?? null,
+        processGroupAlive,
+      },
+    });
+  }
+
   async function cancelRunInternal(runId: string, reason = "Cancelled by control plane", options: CancelRunOptions = {}) {
     const run = await getRun(runId);
     if (!run) throw notFound("Heartbeat run not found");
@@ -14098,6 +14224,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(options.resultJson ?? {}),
         }
       : options.resultJson;
+
+    await appendPreCancelEvidenceEvent(run, reason, errorCode);
 
     const running = runningProcesses.get(run.id);
     try {
@@ -14131,7 +14259,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
 
     if (cancelled) {
-      await appendRunEvent(cancelled, 1, {
+      await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",

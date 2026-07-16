@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -255,6 +255,42 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     }
     return { companyId, managerId, coderId, issueId, runId, issuePrefix };
   }
+
+  it("captures zero-output and stale-PID evidence before cancellation", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.cancelRun(runId, "operator cancelled suspected silent run", {
+      errorCode: "operator_cancelled_silent_run",
+    });
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("cancelled");
+
+    const events = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, runId))
+      .orderBy(asc(heartbeatRunEvents.seq));
+
+    expect(events[0]).toMatchObject({
+      stream: "system",
+      level: "warn",
+      message: "pre-cancel run evidence captured",
+    });
+    expect(events[0]?.payload).toMatchObject({
+      errorCode: "operator_cancelled_silent_run",
+      lastOutputAt: null,
+      lastOutputSeq: 0,
+      processPid: null,
+      processPidAlive: null,
+    });
+    expect(events[1]?.message).toBe("run cancelled");
+  });
 
   it("creates one medium-priority evaluation issue for a suspicious silent run", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");

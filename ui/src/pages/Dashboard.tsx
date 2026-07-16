@@ -266,13 +266,13 @@ export function Dashboard() {
             <MetricCard
               icon={DollarSign}
               value={formatCents(data.costs.monthSpendCents)}
-              label="Month Spend"
+              label="Spend MTD"
               to="/costs"
               description={
                 <span>
                   {data.costs.monthBudgetCents > 0
-                    ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} budget`
-                    : "Unlimited budget"}
+                    ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} monthly budget`
+                    : "Unlimited monthly budget"}
                 </span>
               }
             />
@@ -292,7 +292,7 @@ export function Dashboard() {
           </div>
 
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            <ChartCard title="Run Activity" subtitle="Last 14 days">
+            <ChartCard title="Run Activity" subtitle="Current 14-day window">
               <RunActivityChart activity={data.runActivity} />
             </ChartCard>
             <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
