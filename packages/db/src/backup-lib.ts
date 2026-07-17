@@ -1,7 +1,7 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { accessSync, constants, createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { basename, delimiter, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
@@ -72,6 +72,13 @@ const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
+
+export type PgDumpBinaryResolution = {
+  binary: string;
+  serverMajor: number;
+  binaryMajor: number | null;
+  source: "override" | "versioned" | "unversioned";
+};
 
 function sanitizeRestoreErrorMessage(error: unknown): string {
   if (error && typeof error === "object") {
@@ -292,6 +299,88 @@ function appendCapturedStderr(previous: string, chunk: Buffer | string): string 
   return Buffer.from(next, "utf8").subarray(-BACKUP_CLI_STDERR_BYTES).toString("utf8");
 }
 
+function parsePostgresMajorVersion(raw: string): number | null {
+  const match = raw.match(/(\d+)(?:\.\d+)?/);
+  if (!match) return null;
+  const major = Number.parseInt(match[1]!, 10);
+  return Number.isInteger(major) && major > 0 ? major : null;
+}
+
+function parseServerMajorFromVersionNum(raw: string): number | null {
+  const versionNum = Number.parseInt(raw.trim(), 10);
+  if (!Number.isInteger(versionNum) || versionNum <= 0) return null;
+  return versionNum >= 100000 ? Math.floor(versionNum / 10000) : Math.floor(versionNum / 100);
+}
+
+function executableExists(binary: string, pathEnv = process.env.PATH ?? ""): boolean {
+  const paths = binary.includes("/")
+    ? [binary]
+    : pathEnv.split(delimiter).filter(Boolean).map((entry) => resolve(entry, binary));
+  for (const candidate of paths) {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return true;
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return false;
+}
+
+function readPgDumpMajor(binary: string, env: NodeJS.ProcessEnv = process.env): number | null {
+  const version = spawnSync(binary, ["--version"], {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (version.error || version.status !== 0) return null;
+  return parsePostgresMajorVersion(`${version.stdout ?? ""}\n${version.stderr ?? ""}`);
+}
+
+export function resolvePgDumpBinaryForServerMajor(
+  serverMajor: number,
+  env: NodeJS.ProcessEnv = process.env,
+): PgDumpBinaryResolution | null {
+  const override = env.PAPERCLIP_PG_DUMP_PATH?.trim();
+  if (override) {
+    const binaryMajor = readPgDumpMajor(override, env);
+    if (binaryMajor === null) {
+      throw new Error(`Could not determine PostgreSQL major version for PAPERCLIP_PG_DUMP_PATH: ${override}`);
+    }
+    if (binaryMajor !== serverMajor) {
+      throw new Error(
+        `PAPERCLIP_PG_DUMP_PATH points to PostgreSQL ${binaryMajor} pg_dump, but the server is PostgreSQL ${serverMajor}`,
+      );
+    }
+    return { binary: override, serverMajor, binaryMajor, source: "override" };
+  }
+
+  const pathEnv = env.PATH ?? process.env.PATH ?? "";
+  const candidates = [
+    `pg_dump-${serverMajor}`,
+    `/usr/lib/postgresql/${serverMajor}/bin/pg_dump`,
+    `/opt/homebrew/opt/postgresql@${serverMajor}/bin/pg_dump`,
+    `/usr/local/opt/postgresql@${serverMajor}/bin/pg_dump`,
+  ];
+
+  for (const binary of candidates) {
+    if (!executableExists(binary, pathEnv)) continue;
+    const binaryMajor = readPgDumpMajor(binary, env);
+    if (binaryMajor === serverMajor) {
+      return { binary, serverMajor, binaryMajor, source: "versioned" };
+    }
+  }
+
+  if (executableExists("pg_dump", pathEnv)) {
+    const binaryMajor = readPgDumpMajor("pg_dump", env);
+    if (binaryMajor === serverMajor) {
+      return { binary: "pg_dump", serverMajor, binaryMajor, source: "unversioned" };
+    }
+  }
+
+  return null;
+}
+
 async function waitForChildExit(child: ReturnType<typeof spawn>, label: string): Promise<void> {
   let stderr = "";
   child.stderr?.on("data", (chunk) => {
@@ -315,10 +404,10 @@ async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
+  pgDumpBin: string;
 }): Promise<void> {
-  const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
   const child = spawn(
-    pgDumpBin,
+    opts.pgDumpBin,
     [
       `--dbname=${opts.connectionString}`,
       "--format=plain",
@@ -342,7 +431,7 @@ async function runPgDumpBackup(opts: {
 
   await Promise.all([
     pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
-    waitForChildExit(child, pgDumpBin),
+    waitForChildExit(child, opts.pgDumpBin),
   ]);
 }
 
@@ -540,31 +629,45 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
   try {
     if (backupEngine === "pg_dump" || (backupEngine === "auto" && canUsePgDump)) {
-      await sql`SELECT 1`;
-      try {
-        await closeSql();
-        await runPgDumpBackup({
-          connectionString: opts.connectionString,
-          backupFile,
-          connectTimeout,
-        });
-        await writer.abort();
-        const sizeBytes = statSync(backupFile).size;
-        const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
-        return {
-          backupFile,
-          sizeBytes,
-          prunedCount,
-        };
-      } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
-        }
+      const serverVersionRows = await sql<{ server_version_num: string }[]>`SHOW server_version_num`;
+      const serverMajor = parseServerMajorFromVersionNum(serverVersionRows[0]?.server_version_num ?? "");
+      const pgDump = serverMajor ? resolvePgDumpBinaryForServerMajor(serverMajor) : null;
+
+      if (!pgDump) {
         if (backupEngine === "pg_dump") {
-          throw error;
+          throw new Error(
+            serverMajor
+              ? `No pg_dump binary matching PostgreSQL server major ${serverMajor} was found. Install pg_dump-${serverMajor} or set PAPERCLIP_PG_DUMP_PATH to a matching binary.`
+              : "Could not determine PostgreSQL server major version for pg_dump selection.",
+          );
         }
-        sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
-        sqlClosed = false;
+      } else {
+        try {
+          await closeSql();
+          await runPgDumpBackup({
+            connectionString: opts.connectionString,
+            backupFile,
+            connectTimeout,
+            pgDumpBin: pgDump.binary,
+          });
+          await writer.abort();
+          const sizeBytes = statSync(backupFile).size;
+          const prunedCount = pruneOldBackups(opts.backupDir, retention, filenamePrefix);
+          return {
+            backupFile,
+            sizeBytes,
+            prunedCount,
+          };
+        } catch (error) {
+          if (existsSync(backupFile)) {
+            try { unlinkSync(backupFile); } catch { /* ignore */ }
+          }
+          if (backupEngine === "pg_dump") {
+            throw error;
+          }
+          sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+          sqlClosed = false;
+        }
       }
     }
 

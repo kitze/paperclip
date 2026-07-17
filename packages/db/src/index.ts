@@ -20,12 +20,22 @@ export {
 export {
   runDatabaseBackup,
   runDatabaseRestore,
+  resolvePgDumpBinaryForServerMajor,
   formatDatabaseBackupResult,
   type BackupRetentionPolicy,
+  type PgDumpBinaryResolution,
   type RunDatabaseBackupOptions,
   type RunDatabaseBackupResult,
   type RunDatabaseRestoreOptions,
 } from "./backup-lib.js";
+export {
+  assertSafePg16RestoreTarget,
+  queryRestorePreflightTargetIdentity,
+  runPg16RestorePreflight,
+  type Pg16RestorePreflightOptions,
+  type RestorePreflightSafetyOptions,
+  type RestorePreflightTargetIdentity,
+} from "./restore-preflight.js";
 export {
   createEmbeddedPostgresLogBuffer,
   formatEmbeddedPostgresError,

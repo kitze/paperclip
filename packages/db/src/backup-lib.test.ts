@@ -3,7 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
-import { createBufferedTextFileWriter, runDatabaseBackup, runDatabaseRestore } from "./backup-lib.js";
+import {
+  createBufferedTextFileWriter,
+  resolvePgDumpBinaryForServerMajor,
+  runDatabaseBackup,
+  runDatabaseRestore,
+} from "./backup-lib.js";
 import { ensurePostgresDatabase } from "./client.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -70,6 +75,67 @@ describe("createBufferedTextFileWriter", () => {
     await writer.close();
 
     expect(fs.readFileSync(outputPath, "utf8")).toBe(lines.join("\n"));
+  });
+});
+
+describe("resolvePgDumpBinaryForServerMajor", () => {
+  function writeFakePgDump(dir: string, name: string, major: number): string {
+    const filePath = path.join(dir, name);
+    fs.writeFileSync(
+      filePath,
+      [
+        "#!/usr/bin/env sh",
+        `echo 'pg_dump (PostgreSQL) ${major}.9'`,
+      ].join("\n"),
+      "utf8",
+    );
+    fs.chmodSync(filePath, 0o755);
+    return filePath;
+  }
+
+  it("prefers a versioned pg_dump matching the server major", () => {
+    const tempDir = createTempDir("paperclip-pg-dump-resolver-");
+    writeFakePgDump(tempDir, "pg_dump", 15);
+    writeFakePgDump(tempDir, "pg_dump-16", 16);
+
+    const resolved = resolvePgDumpBinaryForServerMajor(16, {
+      PATH: `${tempDir}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+
+    expect(resolved).toMatchObject({
+      binary: "pg_dump-16",
+      serverMajor: 16,
+      binaryMajor: 16,
+      source: "versioned",
+    });
+  });
+
+  it("uses unversioned pg_dump only when it reports the matching major", () => {
+    const tempDir = createTempDir("paperclip-pg-dump-unversioned-");
+    writeFakePgDump(tempDir, "pg_dump", 16);
+
+    const resolved = resolvePgDumpBinaryForServerMajor(16, {
+      PATH: `${tempDir}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+
+    expect(resolved).toMatchObject({
+      binary: "pg_dump",
+      serverMajor: 16,
+      binaryMajor: 16,
+      source: "unversioned",
+    });
+  });
+
+  it("rejects an explicit pg_dump override for the wrong major", () => {
+    const tempDir = createTempDir("paperclip-pg-dump-override-");
+    const override = writeFakePgDump(tempDir, "custom-pg-dump", 15);
+
+    expect(() =>
+      resolvePgDumpBinaryForServerMajor(16, {
+        PATH: `${tempDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        PAPERCLIP_PG_DUMP_PATH: override,
+      }),
+    ).toThrow(/server is PostgreSQL 16/);
   });
 });
 
