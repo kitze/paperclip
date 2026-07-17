@@ -86,6 +86,51 @@ function boundedFailureReason(err: unknown): string {
   return message.length > 500 ? `${message.slice(0, 500)}...` : message;
 }
 
+function pathIsWithinRoot(candidate: string, root: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+async function resolveOpenCodeInstructionsFile(input: {
+  cwd: string;
+  instructionsFilePath: string;
+}): Promise<{ path: string; dir: string }> {
+  const configuredPath = input.instructionsFilePath.trim();
+  const candidatePath = path.resolve(input.cwd, configuredPath);
+
+  let realWorkspaceRoot: string;
+  let realInstructionsPath: string;
+  try {
+    [realWorkspaceRoot, realInstructionsPath] = await Promise.all([
+      fs.realpath(input.cwd),
+      fs.realpath(candidatePath),
+    ]);
+  } catch (err) {
+    throw new Error(`could not resolve real path: ${boundedFailureReason(err)}`);
+  }
+
+  if (!pathIsWithinRoot(realInstructionsPath, realWorkspaceRoot)) {
+    throw new Error(
+      `resolved instructionsFilePath escapes workspace root: ${realInstructionsPath} is outside ${realWorkspaceRoot}`,
+    );
+  }
+
+  let stat;
+  try {
+    stat = await fs.stat(realInstructionsPath);
+  } catch (err) {
+    throw new Error(`could not stat resolved instructionsFilePath: ${boundedFailureReason(err)}`);
+  }
+  if (!stat.isFile()) {
+    throw new Error(`resolved instructionsFilePath is not a file: ${realInstructionsPath}`);
+  }
+
+  return {
+    path: realInstructionsPath,
+    dir: `${path.dirname(realInstructionsPath)}/`,
+  };
+}
+
 export function createOpenCodeInstructionBundlePreflightFailure(input: {
   instructionsFilePath: string;
   reason: string;
@@ -520,14 +565,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] OpenCode session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
     }
-    const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-    const resolvedInstructionsFilePath = instructionsFilePath
-      ? path.resolve(cwd, instructionsFilePath)
-      : "";
-    const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
+    const configuredInstructionsFilePath = asString(config.instructionsFilePath, "").trim();
+    let resolvedInstructionsFilePath = "";
+    let instructionsDir = "";
     let instructionsPrefix = "";
-    if (resolvedInstructionsFilePath) {
+    if (configuredInstructionsFilePath) {
+      const candidateInstructionsFilePath = path.resolve(cwd, configuredInstructionsFilePath);
       try {
+        const resolvedInstructionsFile = await resolveOpenCodeInstructionsFile({
+          cwd,
+          instructionsFilePath: configuredInstructionsFilePath,
+        });
+        resolvedInstructionsFilePath = resolvedInstructionsFile.path;
+        instructionsDir = resolvedInstructionsFile.dir;
         const instructionsContents = await fs.readFile(resolvedInstructionsFilePath, "utf8");
         instructionsPrefix =
           `${instructionsContents}\n\n` +
@@ -537,10 +587,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const reason = boundedFailureReason(err);
         await onLog(
           "stdout",
-          `[paperclip] OpenCode instruction-bundle preflight failed for "${resolvedInstructionsFilePath}": ${reason}\n`,
+          `[paperclip] OpenCode instruction-bundle preflight failed for "${candidateInstructionsFilePath}": ${reason}\n`,
         );
         return createOpenCodeInstructionBundlePreflightFailure({
-          instructionsFilePath: resolvedInstructionsFilePath,
+          instructionsFilePath: candidateInstructionsFilePath,
           reason,
         });
       }

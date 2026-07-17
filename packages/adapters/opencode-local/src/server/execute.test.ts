@@ -69,11 +69,8 @@ describe("ensureRemoteOpenCodeModelConfiguredAndAvailable", () => {
 });
 
 describe("execute", () => {
-  it("fails closed when configured instructions cannot be read", async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-instructions-"));
-    const workspace = path.join(root, "workspace");
+  async function writeOpenCodeStub(root: string, body: string[] = []) {
     const commandPath = path.join(root, "opencode");
-    await fs.mkdir(workspace, { recursive: true });
     await fs.writeFile(
       commandPath,
       [
@@ -82,41 +79,95 @@ describe("execute", () => {
         "  echo 'openai/gpt-5.1-codex-mini'",
         "  exit 0",
         "fi",
-        "echo should-not-run",
+        ...body,
         "exit 0",
         "",
       ].join("\n"),
       "utf8",
     );
     await fs.chmod(commandPath, 0o755);
+    return commandPath;
+  }
+
+  function buildExecuteInput(input: {
+    runId: string;
+    command: string;
+    cwd: string;
+    instructionsFilePath?: string;
+    onMeta?: Parameters<typeof execute>[0]["onMeta"];
+  }): Parameters<typeof execute>[0] {
+    return {
+      runId: input.runId,
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "OpenCode Coder",
+        adapterType: "opencode_local",
+        adapterConfig: {},
+      },
+      runtime: {
+        sessionId: null,
+        sessionParams: null,
+        sessionDisplayId: null,
+        taskKey: null,
+      },
+      config: {
+        command: input.command,
+        cwd: input.cwd,
+        model: "openai/gpt-5.1-codex-mini",
+        promptTemplate: "Follow the paperclip heartbeat.",
+        ...(input.instructionsFilePath ? { instructionsFilePath: input.instructionsFilePath } : {}),
+      },
+      context: {},
+      authToken: "run-jwt-token",
+      onLog: async () => {},
+      ...(input.onMeta ? { onMeta: input.onMeta } : {}),
+    };
+  }
+
+  it("loads configured instructions from the workspace real path", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-instructions-valid-"));
+    const workspace = path.join(root, "workspace");
+    const instructionsPath = path.join(workspace, "AGENTS.md");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(instructionsPath, "Stay inside the workspace.\n", "utf8");
+    const commandPath = await writeOpenCodeStub(root);
+    const metaPrompts: string[] = [];
 
     try {
-      const result = await execute({
+      const result = await execute(buildExecuteInput({
+        runId: "run-opencode-valid-instructions",
+        command: commandPath,
+        cwd: workspace,
+        instructionsFilePath: "AGENTS.md",
+        onMeta: async (meta) => {
+          if (typeof meta.prompt === "string") metaPrompts.push(meta.prompt);
+        },
+      }));
+
+      const realInstructionsPath = await fs.realpath(instructionsPath);
+      expect(result.exitCode).toBe(0);
+      expect(metaPrompts[0]).toContain("Stay inside the workspace.");
+      expect(metaPrompts[0]).toContain(`loaded from ${realInstructionsPath}`);
+      expect(metaPrompts[0]).toContain(`Resolve any relative file references from ${path.dirname(realInstructionsPath)}/`);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when configured instructions cannot be read", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-instructions-"));
+    const workspace = path.join(root, "workspace");
+    await fs.mkdir(workspace, { recursive: true });
+    const commandPath = await writeOpenCodeStub(root, ["echo should-not-run"]);
+
+    try {
+      const result = await execute(buildExecuteInput({
         runId: "run-opencode-missing-instructions",
-        agent: {
-          id: "agent-1",
-          companyId: "company-1",
-          name: "OpenCode Coder",
-          adapterType: "opencode_local",
-          adapterConfig: {},
-        },
-        runtime: {
-          sessionId: null,
-          sessionParams: null,
-          sessionDisplayId: null,
-          taskKey: null,
-        },
-        config: {
           command: commandPath,
           cwd: workspace,
-          model: "openai/gpt-5.1-codex-mini",
-          promptTemplate: "Follow the paperclip heartbeat.",
-          instructionsFilePath: "missing/AGENTS.md",
-        },
-        context: {},
-        authToken: "run-jwt-token",
-        onLog: async () => {},
-      });
+        instructionsFilePath: "missing/AGENTS.md",
+      }));
 
       expect(result.exitCode).toBe(1);
       expect(result.errorCode).toBe("opencode_instruction_bundle_unreadable");
@@ -125,6 +176,120 @@ describe("execute", () => {
       expect(result.resultJson).toMatchObject({
         preflight: "instruction_bundle",
         instructionsFilePath: path.join(workspace, "missing", "AGENTS.md"),
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects configured instruction traversal outside the workspace real path", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-instructions-traversal-"));
+    const workspace = path.join(root, "workspace");
+    const outsideInstructions = path.join(root, "AGENTS.md");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(outsideInstructions, "external instructions\n", "utf8");
+    const commandPath = await writeOpenCodeStub(root);
+
+    try {
+      const result = await execute(buildExecuteInput({
+        runId: "run-opencode-traversal-instructions",
+        command: commandPath,
+        cwd: workspace,
+        instructionsFilePath: "../AGENTS.md",
+      }));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("opencode_instruction_bundle_unreadable");
+      expect(result.errorMessage).toContain("escapes workspace root");
+      expect(result.resultJson).toMatchObject({
+        preflight: "instruction_bundle",
+        instructionsFilePath: outsideInstructions,
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects absolute instruction paths outside the workspace real path", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-instructions-absolute-"));
+    const workspace = path.join(root, "workspace");
+    const outside = path.join(root, "outside");
+    const outsideInstructions = path.join(outside, "AGENTS.md");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(outside, { recursive: true });
+    await fs.writeFile(outsideInstructions, "external instructions\n", "utf8");
+    const commandPath = await writeOpenCodeStub(root);
+
+    try {
+      const result = await execute(buildExecuteInput({
+        runId: "run-opencode-absolute-external-instructions",
+        command: commandPath,
+        cwd: workspace,
+        instructionsFilePath: outsideInstructions,
+      }));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("opencode_instruction_bundle_unreadable");
+      expect(result.errorMessage).toContain("escapes workspace root");
+      expect(result.resultJson).toMatchObject({
+        preflight: "instruction_bundle",
+        instructionsFilePath: outsideInstructions,
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects instruction symlinks that resolve outside the workspace real path", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-instructions-symlink-"));
+    const workspace = path.join(root, "workspace");
+    const outsideInstructions = path.join(root, "outside.md");
+    const symlinkInstructions = path.join(workspace, "AGENTS.md");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(outsideInstructions, "external instructions\n", "utf8");
+    await fs.symlink(outsideInstructions, symlinkInstructions);
+    const commandPath = await writeOpenCodeStub(root);
+
+    try {
+      const result = await execute(buildExecuteInput({
+        runId: "run-opencode-symlink-escape-instructions",
+        command: commandPath,
+        cwd: workspace,
+        instructionsFilePath: "AGENTS.md",
+      }));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("opencode_instruction_bundle_unreadable");
+      expect(result.errorMessage).toContain("escapes workspace root");
+      expect(result.resultJson).toMatchObject({
+        preflight: "instruction_bundle",
+        instructionsFilePath: symlinkInstructions,
+      });
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects directory instruction targets", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-instructions-directory-"));
+    const workspace = path.join(root, "workspace");
+    await fs.mkdir(path.join(workspace, "AGENTS.md"), { recursive: true });
+    const commandPath = await writeOpenCodeStub(root);
+
+    try {
+      const result = await execute(buildExecuteInput({
+        runId: "run-opencode-directory-instructions",
+        command: commandPath,
+        cwd: workspace,
+        instructionsFilePath: "AGENTS.md",
+      }));
+
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode).toBe("opencode_instruction_bundle_unreadable");
+      expect(result.errorMessage).toContain("not a file");
+      expect(result.resultJson).toMatchObject({
+        preflight: "instruction_bundle",
+        instructionsFilePath: path.join(workspace, "AGENTS.md"),
       });
     } finally {
       await fs.rm(root, { recursive: true, force: true });
