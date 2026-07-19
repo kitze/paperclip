@@ -622,6 +622,20 @@ Environment overrides:
 - `PAPERCLIP_DB_BACKUP_RETENTION_DAYS=<days>`
 - `PAPERCLIP_DB_BACKUP_DIR=/absolute/or/~/path`
 
+## Productivity Review Generation
+
+Paperclip automatically reconciles productivity-review tasks during server
+startup and scheduled heartbeat recovery. To stop creating or refreshing those
+reviews, restart the server with:
+
+```sh
+PRODUCTIVITY_REVIEW_ENABLED=false
+```
+
+The default is `true`. Disabling reconciliation does not cancel or delete
+existing productivity-review tasks; handle those separately after the flag is
+deployed.
+
 DB backups are not full instance filesystem backups. For full local disaster
 recovery, also back up local storage files and the local encrypted secrets key if
 those providers are enabled.
