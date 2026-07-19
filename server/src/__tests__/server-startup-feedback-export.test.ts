@@ -12,10 +12,13 @@ const {
   createDbMock,
   detectPortMock,
   deriveAuthTrustedOriginsMock,
+  environmentCustomImagesServiceMock,
   feedbackExportServiceMock,
   feedbackServiceFactoryMock,
   fakeServer,
+  heartbeatServiceMock,
   loadConfigMock,
+  routineServiceMock,
 } = vi.hoisted(() => {
   const createAppMock = vi.fn(async () => ((_: unknown, __: unknown) => {}) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
@@ -26,6 +29,36 @@ const {
     flushPendingFeedbackTraces: vi.fn(async () => ({ attempted: 0, sent: 0, failed: 0 })),
   };
   const feedbackServiceFactoryMock = vi.fn(() => feedbackExportServiceMock);
+  const heartbeatServiceMock = {
+    reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
+    promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
+    resumeQueuedRuns: vi.fn(async () => undefined),
+    reconcileStrandedAssignedIssues: vi.fn(async () => ({
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    })),
+    reconcileIssueGraphLiveness: vi.fn(async () => ({
+      escalationsCreated: 0,
+      dependencyWakesHealed: 0,
+    })),
+    reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
+    scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
+    sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
+    reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
+    sweepExpiredRuntimeStatuses: vi.fn(() => 0),
+    tickTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
+  };
+  const environmentCustomImagesServiceMock = {
+    cleanupExpiredSetupSessions: vi.fn(async () => ({ scanned: 0, timedOut: 0, failed: 0 })),
+  };
+  const routineServiceMock = {
+    tickScheduledTriggers: vi.fn(async () => ({ triggered: 0 })),
+  };
   const fakeServer = {
     once: vi.fn().mockReturnThis(),
     off: vi.fn().mockReturnThis(),
@@ -43,10 +76,13 @@ const {
     createDbMock,
     detectPortMock,
     deriveAuthTrustedOriginsMock,
+    environmentCustomImagesServiceMock,
     feedbackExportServiceMock,
     feedbackServiceFactoryMock,
     fakeServer,
+    heartbeatServiceMock,
     loadConfigMock,
+    routineServiceMock,
   };
 });
 
@@ -86,6 +122,7 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
     feedbackExportBackendToken: "telemetry-token",
     heartbeatSchedulerEnabled: false,
     heartbeatSchedulerIntervalMs: 30000,
+    productivityReviewEnabled: true,
     companyDeletionEnabled: false,
     ...overrides,
   };
@@ -144,20 +181,8 @@ vi.mock("../services/index.js", () => ({
   })),
   feedbackService: feedbackServiceFactoryMock,
   bootstrapExecutionPolicyFromEnv: vi.fn(async () => null),
-  heartbeatService: vi.fn(() => ({
-    reapOrphanedRuns: vi.fn(async () => undefined),
-    promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
-    resumeQueuedRuns: vi.fn(async () => undefined),
-    reconcileStrandedAssignedIssues: vi.fn(async () => ({
-      dispatchRequeued: 0,
-      continuationRequeued: 0,
-      successfulRunHandoffEscalated: 0,
-      escalated: 0,
-      skipped: 0,
-      issueIds: [],
-    })),
-    tickTimers: vi.fn(async () => ({ enqueued: 0 })),
-  })),
+  environmentCustomImageService: vi.fn(() => environmentCustomImagesServiceMock),
+  heartbeatService: vi.fn(() => heartbeatServiceMock),
   instanceSettingsService: vi.fn(() => ({
     getGeneral: vi.fn(async () => ({
       backupRetention: {
@@ -179,9 +204,7 @@ vi.mock("../services/index.js", () => ({
     seededAgentIds: [],
   })),
   reconcilePersistedRuntimeServicesOnStartup: vi.fn(async () => ({ reconciled: 0 })),
-  routineService: vi.fn(() => ({
-    tickScheduledTriggers: vi.fn(async () => ({ triggered: 0 })),
-  })),
+  routineService: vi.fn(() => routineServiceMock),
 }));
 
 vi.mock("../storage/index.js", () => ({
@@ -231,6 +254,47 @@ describe("startServer feedback export wiring", () => {
       storageService: { id: "storage-service" },
       serverPort: 3210,
     });
+  });
+
+  it.each([
+    ["enabled", true, 2],
+    ["disabled", false, 0],
+  ])("keeps startup and scheduled productivity reconciliation %s", async (_label, enabled, expectedCalls) => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      productivityReviewEnabled: enabled,
+    }));
+    let schedulerTick: (() => void) | undefined;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        schedulerTick = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    try {
+      await startServer();
+      expect(heartbeatServiceMock.reconcileProductivityReviews).toHaveBeenCalledTimes(
+        enabled ? 1 : 0,
+      );
+
+      expect(schedulerTick).toBeDefined();
+      schedulerTick?.();
+      await vi.waitFor(() => {
+        expect(heartbeatServiceMock.sweepStaleIssueLocks).toHaveBeenCalledTimes(2);
+      });
+
+      if (enabled) {
+        await vi.waitFor(() => {
+          expect(heartbeatServiceMock.reconcileProductivityReviews).toHaveBeenCalledTimes(expectedCalls);
+        });
+      } else {
+        await Promise.resolve();
+        expect(heartbeatServiceMock.reconcileProductivityReviews).not.toHaveBeenCalled();
+      }
+    } finally {
+      setIntervalSpy.mockRestore();
+    }
   });
 
   it("refuses authenticated public startup without an external database URL", async () => {
