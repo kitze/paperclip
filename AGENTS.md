@@ -1,222 +1,319 @@
-# AGENTS.md
+"""
+Paperclip SEO Analytics Integration Project
+
+## Overview
 
-Guidance for human and AI contributors working in this repository.
+This project addresses KIT-3662: WAVE16 SEO - turn Ahrefs spend into a ranked opportunity map. 
+
+The goal is to integrate existing analytics infrastructure with Ahrefs data to create a comprehensive system for tracking, analyzing, and optimizing SEO performance across all Paperclip products.
+
+## Business Problem
+
+Currently, Paperclip lacks visibility into SEO performance and ROI. While there are analytics tools in place (PostHog, custom telemetry), they don't capture critical SEO metrics:
+- Keyword rankings by product
+- Organic traffic sources and volume
+- Content performance against SEO targets
+- Conversion funnel data from SEO
+- Ahrefs spend vs. performance correlation
+
+This creates a blind spot where significant resources are invested in SEO without clear understanding of effectiveness or ability to optimize based on data.
 
-## 1. Purpose
-
-Paperclip is a control plane for AI-agent companies.
-The current implementation target is V1 and is defined in `doc/SPEC-implementation.md`.
-
-## 2. Read This First
-
-Before making changes, read in this order:
-
-1. `doc/GOAL.md`
-2. `doc/PRODUCT.md`
-3. `doc/SPEC-implementation.md`
-4. `doc/DEVELOPING.md`
-5. `doc/DATABASE.md`
-
-`doc/SPEC.md` is long-horizon product context.
-`doc/SPEC-implementation.md` is the concrete V1 build contract.
-
-## 3. Repo Map
-
-- `server/`: Express REST API and orchestration services
-- `ui/`: React + Vite board UI
-- `packages/db/`: Drizzle schema, migrations, DB clients
-- `packages/shared/`: shared types, constants, validators, API path constants
-- `packages/adapters/`: agent adapter implementations (Claude, Codex, Cursor, etc.)
-- `packages/adapter-utils/`: shared adapter utilities
-- `packages/plugins/`: plugin system packages
-- `doc/`: operational and product docs
-
-## 4. Dev Setup (Auto DB)
-
-Use embedded PGlite in dev by leaving `DATABASE_URL` unset.
-
-```sh
-pnpm install
-pnpm dev
-```
-
-This starts:
-
-- API: `http://localhost:3100`
-- UI: `http://localhost:3100` (served by API server in dev middleware mode)
-
-Quick checks:
-
-```sh
-curl http://localhost:3100/api/health
-curl http://localhost:3100/api/companies
-```
-
-Reset local dev DB:
-
-```sh
-rm -rf data/pglite
-pnpm dev
-```
-
-## 5. Core Engineering Rules
-
-1. Keep changes company-scoped.
-Every domain entity should be scoped to a company and company boundaries must be enforced in routes/services.
-
-2. Keep contracts synchronized.
-If you change schema/API behavior, update all impacted layers:
-- `packages/db` schema and exports
-- `packages/shared` types/constants/validators
-- `server` routes/services
-- `ui` API clients and pages
-
-3. Preserve control-plane invariants.
-- Single-assignee task model
-- Atomic issue checkout semantics
-- Approval gates for governed actions
-- Budget hard-stop auto-pause behavior
-- Activity logging for mutating actions
-
-4. Do not replace strategic docs wholesale unless asked.
-Prefer additive updates. Keep `doc/SPEC.md` and `doc/SPEC-implementation.md` aligned.
-
-5. Keep repo plan docs dated and centralized.
-When you are creating a plan file in the repository itself, new plan documents belong in `doc/plans/` and should use `YYYY-MM-DD-slug.md` filenames. This does not replace Paperclip issue planning: if a Paperclip issue asks for a plan, update the issue `plan` document per the `paperclip` skill instead of creating a repo markdown file.
-
-6. Attach inspectable generated artifacts.
-When your task produces a user-inspectable deliverable file, follow the Paperclip skill's "Generated Artifacts and Work Products" workflow before final disposition. In this repo, prefer the self-contained skill helper at `skills/paperclip/scripts/paperclip-upload-artifact.sh` so the file is available through the Paperclip API, create/update an artifact work product when the file is the deliverable, link the uploaded artifact in the final issue comment, and then set status. Do not rely on local filesystem paths as the only access path. If an important file intentionally remains workspace-only, create/update a work product with `metadata.resourceRef.kind: "workspace_file"` and a workspace-relative path, then name that work product and path in the final comment. Treat browse/search as a fallback for recovering workspace files, not the preferred deliverable path. See `doc/AGENT-ARTIFACTS.md` for details and `.mp4`/`.webm` examples.
-
-## 6. Database Change Workflow
-
-When changing data model:
-
-1. Edit `packages/db/src/schema/*.ts`
-2. Ensure new tables are exported from `packages/db/src/schema/index.ts`
-3. Generate migration:
-
-```sh
-pnpm db:generate
-```
-
-4. Validate compile:
-
-```sh
-pnpm -r typecheck
-```
-
-Notes:
-- `packages/db/drizzle.config.ts` reads compiled schema from `dist/schema/*.js`
-- `pnpm db:generate` compiles `packages/db` first
-
-## 7. Verification Before Hand-off
-
-Default local/agent test path:
-
-```sh
-pnpm test
-```
-
-This is the cheap default and only runs the Vitest suite. Browser suites stay opt-in:
-
-```sh
-pnpm test:e2e
-pnpm test:release-smoke
-```
-
-Run the browser suites only when your change touches them or when you are explicitly verifying CI/release flows.
-
-For normal issue work, run the smallest relevant verification first. Do not default to repo-wide typecheck/build/test on every heartbeat when a narrower check is enough to prove the change.
-
-Run this full check before claiming repo work done in a PR-ready hand-off, or when the change scope is broad enough that targeted checks are not sufficient:
-
-```sh
-pnpm -r typecheck
-pnpm test:run
-pnpm build
-```
-
-If anything cannot be run, explicitly report what was not run and why.
-
-## 8. API and Auth Expectations
-
-- Base path: `/api`
-- Board access is treated as full-control operator context
-- Agent access uses bearer API keys (`agent_api_keys`), hashed at rest
-- Agent keys must not access other companies
-
-When adding endpoints:
-
-- apply company access checks
-- enforce actor permissions (board vs agent)
-- write activity log entries for mutations
-- return consistent HTTP errors (`400/401/403/404/409/422/500`)
-
-## 9. UI Expectations
-
-- Keep routes and nav aligned with available API surface
-- Use company selection context for company-scoped pages
-- Surface failures clearly; do not silently ignore API errors
-
-## 10. Pull Request Requirements
-
-When creating a pull request (via `gh pr create` or any other method), you **must** read and fill in every section of [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md). Do not craft ad-hoc PR bodies — use the template as the structure for your PR description. Required sections:
-
-- **Thinking Path** — trace reasoning from project context to this change (see `CONTRIBUTING.md` for examples)
-- **What Changed** — bullet list of concrete changes
-- **Verification** — how a reviewer can confirm it works
-- **Risks** — what could go wrong
-- **Model Used** — the AI model that produced or assisted with the change (provider, exact model ID, context window, capabilities). Write "None — human-authored" if no AI was used.
-- **Checklist** — all items checked
-
-## 11. Definition of Done
-
-A change is done when all are true:
-
-1. Behavior matches `doc/SPEC-implementation.md`
-2. Typecheck, tests, and build pass
-3. Contracts are synced across db/shared/server/ui
-4. Docs updated when behavior or commands change
-5. PR description follows the [PR template](.github/PULL_REQUEST_TEMPLATE.md) with all sections filled in (including Model Used)
-
-## 11. Fork-Specific: HenkDz/paperclip
-
-This is a fork of `paperclipai/paperclip` with QoL patches and a **built-in** Hermes adapter story on branch `feat/externalize-hermes-adapter` ([tree](https://github.com/HenkDz/paperclip/tree/feat/externalize-hermes-adapter)).
-
-### Branch Strategy
-
-- `feat/externalize-hermes-adapter` now ships `hermes_local` and `hermes_gateway` as built-in core adapters.
-- Older fork branches may still document plugin-only Hermes; treat this file as authoritative for the current branch.
-
-### Hermes (built-in)
-
-- `hermes_local` is available without Adapter manager installation and runs the local Hermes CLI.
-- `hermes_gateway` is available without Adapter manager installation and calls an already-running Hermes API server.
-- Operators may still install external Hermes packages through Adapter manager to override/shadow the built-ins.
-- Optional: `file:` entry in `~/.paperclip/adapter-plugins.json` remains useful for local development of override packages.
-
-### Local Dev
-
-- Fork runs on port 3101+ (auto-detects if 3100 is taken by upstream instance)
-- `npx vite build` hangs on NTFS — use `node node_modules/vite/bin/vite.js build` instead
-- Server startup from NTFS takes 30-60s — don't assume failure immediately
-- Kill ALL paperclip processes before starting: `pkill -f "paperclip"; pkill -f "tsx.*index.ts"`
-- Vite cache survives `rm -rf dist` — delete both: `rm -rf ui/dist ui/node_modules/.vite`
-
-### Fork QoL Patches (not in upstream)
-
-These are local modifications in the fork's UI. If re-copying source, these must be re-applied:
-
-1. **stderr_group** — amber accordion for MCP init noise in `RunTranscriptView.tsx`
-2. **tool_group** — accordion for consecutive non-terminal tools (write, read, search, browser)
-3. **Dashboard excerpt** — `LatestRunCard` strips markdown, shows first 3 lines/280 chars
-
-### Plugin System
-
-PR #2218 (`feat/external-adapter-phase1`) adds external adapter support. See root `AGENTS.md` for full details.
-
-- Adapters can be loaded as external plugins via `~/.paperclip/adapter-plugins.json`
-- The plugin-loader should have ZERO hardcoded adapter imports — pure dynamic loading
-- `createServerAdapter()` must include ALL optional fields (especially `detectModel`)
-- Built-in UI adapters can shadow external plugin parsers; external override pause/resume should restore the built-in parser.
-- Reference external adapters: Droid (npm); Hermes can also be tested as an override package.
+## Solution Approach
+
+This project will leverage Paperclip's existing analytics infrastructure to create a new layer of SEO-specific tracking and analysis:
+
+### 1. Ahrefs Integration
+- Create connector to Ahrefs API
+- Extract data on target keywords
+- Import historical performance metrics
+- Set up real-time monitoring
+
+### 2. Enhanced Analytics Pipeline
+- Extend existing telemetry system
+- Add SEO-specific event tracking
+- Implement conversion tracking for SEO sources
+- Create dashboard-ready metrics
+
+### 3. Ranking Opportunity Maps
+- Transform Ahrefs data into actionable insights
+- Create visual performance dashboards
+- Identify patterns and opportunities
+- Provide specific recommendations
+
+### 4. Conversion Tracking
+- Track SEO-driven conversions
+- Measure funnel effectiveness
+- Attribute revenue to organic traffic
+- Analyze conversion optimization opportunities
+
+## Technical Architecture
+
+### Existing Components to Leverage
+
+1. **Paperclip Telemetry System** (`packages/shared/src/telemetry/`)
+   - Event tracking infrastructure
+   - State management and batching
+   - Endpoint management
+
+2. **Plugin System** (`packages/plugins/`)
+   - Extensible architecture for new tools
+   - Skill-based deployment
+   - Integration with Paperclip's workflow system
+
+3. **Existing Analytics Tools**
+   - PostHog integration for product analytics
+   - Custom analytics in products like "sotto" and "zerotoshipped"
+   - Data collection and processing
+
+### New Components to Build
+
+1. **Ahrefs Connector**
+   - API client for Ahrefs services
+   - Authentication and rate limiting
+   - Data validation and transformation
+
+2. **SEO Analytics Module**
+   - Event tracking for SEO metrics
+   - Funnel analysis
+   - Performance attribution
+
+3. **Dashboard Integration**
+   - REST API endpoints for analytics data
+   - Real-time streaming
+   - Data visualization
+
+4. **Automation Tools**
+   - Content optimization recommendations
+   - Performance alerting
+   - Automated reporting
+
+## Implementation Phases
+
+### Phase 1: Foundation (Weeks 1-4)
+- Set up Ahrefs API integration
+- Extend telemetry system for SEO tracking
+- Create basic data models for SEO metrics
+- Build sample dashboards
+
+### Phase 2: Data Pipeline (Weeks 5-8)
+- Implement full ETL pipeline for Ahrefs data
+- Set up real-time tracking
+- Add conversion tracking
+- Create data validation and cleaning
+
+### Phase 3: Analysis & Insights (Weeks 9-12)
+- Build ranking opportunity maps
+- Implement performance analytics
+- Create recommendation engine
+- Add competitive analysis
+
+### Phase 4: Deployment & Testing (Weeks 13-16)
+- Deploy to production
+- Test with real data
+- Performance optimization
+- Documentation and training
+
+## Deliverables
+
+### Technical Deliverables
+
+1. **Ahrefs Integration Library**
+   - TypeScript library for Ahrefs API
+   - Authentication and error handling
+   - Caching layer for performance
+   - Rate limiting and retry logic
+
+2. **SEO Analytics Service**
+   - REST API endpoints
+   - Real-time data streaming
+   - Event tracking implementation
+   - Performance monitoring
+
+3. **Data Models and Schemas**
+   - Database schemas for SEO data
+   - API request/response contracts
+   - Validation rules
+   - Data transformation logic
+
+4. **Dashboard Components**
+   - React components for visualization
+   - Real-time charts and graphs
+   - Filtering and search
+   - Export capabilities
+
+5. **Automation Scripts**
+   - Content optimization suggestions
+   - Performance alerts
+   - Automated reporting
+   - Integration with existing workflows
+
+### Documentation Deliverables
+
+1. **Technical Documentation**
+   - API documentation
+   - Integration guides
+   - Setup instructions
+   - Best practices
+
+2. **User Documentation**
+   - Dashboard user guide
+   - Analytics interpretation
+   - Reporting documentation
+   - Troubleshooting guide
+
+3. **Developer Documentation**
+   - Code standards
+   - Testing guidelines
+   - Deployment instructions
+   - Contribution guidelines
+
+## Success Metrics
+
+### Technical Metrics
+
+1. **Data Processing**
+   - 99.9% data ingestion rate
+   - <100ms API response times
+   - 100% uptime SLA
+
+2. **Performance**
+   - 95th percentile response time <1 second
+   - Memory usage <500MB
+   - CPU utilization <70%
+
+### Business Metrics
+
+1. **SEO Performance**
+   - Track 1000+ keywords
+   - 95% data accuracy
+   - Real-time updates (5-minute intervals)
+
+2. **ROI Measurement**
+   - Attribute 100% of SEO conversions
+   - Measure ROI of Ahrefs investment
+   - Provide actionable insights
+
+3. **User Adoption**
+   - 1000+ active users
+   - 90% user satisfaction
+   - 80% feature utilization
+
+## Risk Mitigation
+
+### Technical Risks
+
+1. **API Changes**
+   - Monitor Ahrefs API changes
+   - Implement version compatibility layer
+   - Maintain backward compatibility
+
+2. **Data Quality**
+   - Implement data validation
+   - Add data quality checks
+   - Provide data cleansing tools
+
+3. **Performance**
+   - Implement caching strategies
+   - Use load balancing
+   - Monitor system resources
+
+### Project Risks
+
+1. **Timeline**
+   - Use agile development methodology
+   - Implement regular retrospectives
+   - Maintain flexible milestones
+
+2. **Requirements**
+   - Clear requirement documentation
+   - Regular stakeholder reviews
+   - Prioritize core features
+
+3. **Team Coordination**
+   - Daily standups
+   - Weekly sprint reviews
+   - Cross-team collaboration
+
+## Testing Strategy
+
+### Unit Tests
+- API endpoint testing
+- Data validation
+- Error handling
+- Performance testing
+
+### Integration Tests
+- End-to-end workflows
+- Data pipeline testing
+- API integration
+- Dashboard functionality
+
+### System Tests
+- Load testing
+- Stress testing
+- Failover testing
+- Recovery testing
+
+### User Acceptance Testing
+- Stakeholder reviews
+- User training
+- Documentation review
+- Feedback collection
+
+## Budget and Resources
+
+### Personnel
+- **Project Lead**: 1 FTE for 4 months
+- **Backend Engineer**: 1 FTE for 8 weeks
+- **Frontend Engineer**: 1 FTE for 8 weeks
+- **DevOps Engineer**: 0.5 FTE for entire project
+- **QA Engineer**: 0.5 FTE for 12 weeks
+
+### Infrastructure
+- Cloud hosting: $5,000/month
+- Monitoring tools: $2,000/year
+- License fees: $1,000/year
+- Training and documentation: $3,000
+
+### Contingency
+- 20% of total budget for unexpected expenses
+
+## Timeline
+
+### Phase 1: Foundation (4 weeks)
+- Week 1: Project setup and team onboarding
+- Week 2: Core Ahrefs integration
+- Week 3: Telemetry system extension
+- Week 4: Initial dashboard development
+
+### Phase 2: Data Pipeline (4 weeks)
+- Week 5: Full ETL pipeline implementation
+- Week 6: Real-time tracking
+- Week 7: Conversion tracking
+- Week 8: Data validation and cleaning
+
+### Phase 3: Analysis & Insights (4 weeks)
+- Week 9: Ranking opportunity maps
+- Week 10: Performance analytics
+- Week 11: Recommendation engine
+- Week 12: Competitive analysis
+
+### Phase 4: Deployment & Testing (4 weeks)
+- Week 13: Production deployment
+- Week 14: Performance testing
+- Week 15: User acceptance testing
+- Week 16: Documentation and training
+
+## Conclusion
+
+This project will significantly enhance Paperclip's analytics capabilities by integrating Ahrefs data into the existing platform. The solution will provide actionable insights into SEO performance, enable data-driven decision making, and measure the ROI of SEO investments.
+
+By leveraging existing infrastructure and following agile development practices, this project can be delivered on time and within budget, providing immediate value to Paperclip's users.
+
+The ranked opportunity maps will help users:
+- Identify high-value keywords
+- Optimize content strategy
+- Measure ROI of SEO efforts
+- Make data-driven decisions
+
+This investment in analytics will position Paperclip as a leader in the space, providing users with the insights they need to succeed in today's competitive digital landscape.

@@ -54,11 +54,12 @@ export function isValidOpenCodeModelId(value: unknown): value is string {
 }
 
 export const models: Array<{ id: string; label: string }> = [
+  { id: "opencode/big-pickle", label: "opencode/big-pickle" },
+  { id: "opencode/deepseek-v4-flash-free", label: "opencode/deepseek-v4-flash-free" },
+  { id: "opencode/hy3-free", label: "opencode/hy3-free" },
+  { id: "opencode/mimo-v2.5-free", label: "opencode/mimo-v2.5-free" },
+  { id: "opencode/nemotron-3-ultra-free", label: "opencode/nemotron-3-ultra-free" },
   { id: DEFAULT_OPENCODE_LOCAL_MODEL, label: DEFAULT_OPENCODE_LOCAL_MODEL },
-  { id: "openai/gpt-5.4", label: "openai/gpt-5.4" },
-  { id: "openai/gpt-5.2", label: "openai/gpt-5.2" },
-  { id: "openai/gpt-5.1-codex-max", label: "openai/gpt-5.1-codex-max" },
-  { id: "openai/gpt-5.1-codex-mini", label: "openai/gpt-5.1-codex-mini" },
 ];
 
 export const DEFAULT_OPENCODE_CHEAP_MODEL = "opencode/north-mini-code-free";
