@@ -1,0 +1,21 @@
+name: paperclip-postgres
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: paperclip-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      - POSTGRES_PASSWORD=a169daeac86b9fcd3c4870b326a8b1610a41f1ea1f0ca03e
+      - POSTGRES_USER=paperclip_kitze
+      - POSTGRES_DB=paperclip_kitze
+    volumes:
+      - /root/paperclip-postgres/data:/var/lib/postgresql/data
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
